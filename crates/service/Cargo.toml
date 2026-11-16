@@ -1,0 +1,39 @@
+[package]
+name = "chain-payments-service"
+description = "Chain Payments: the public session API, the merchant API, price sources, the watcher and webhook delivery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+chain-payments-core.workspace = true
+chain-payments-chain-sui.workspace = true
+chain-payments-store.workspace = true
+access-gate-gateway-core.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros"] }
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+url.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+http-body-util = "=0.1.5"
+sqlx.workspace = true
+chain-payments-store.workspace = true
+
+[lints]
+workspace = true

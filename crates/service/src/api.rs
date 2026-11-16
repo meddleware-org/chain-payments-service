@@ -283,3 +283,8 @@ pub fn merchant_router(app: Shared) -> Router {
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(app)
 }
+
+/// The worker's own port: its counters (confirmations, webhook deliveries) live in its process, so it serves them itself.
+pub fn worker_router(app: Shared) -> Router {
+    Router::new().route("/metrics", get(metrics)).route("/healthz", get(healthz)).with_state(app)
+}

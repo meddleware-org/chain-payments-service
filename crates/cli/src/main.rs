@@ -41,8 +41,11 @@ enum Command {
         #[arg(long, env = "DB_POOL_SIZE", default_value_t = 8)]
         pool: u32,
     },
-    /// Settle payments, expire sessions and deliver webhooks.
-    Worker,
+    /// Settle payments, expire sessions and deliver webhooks; serves /metrics and /healthz.
+    Worker {
+        #[arg(long, env = "WORKER_LISTEN_ADDR", default_value = "0.0.0.0:8081")]
+        listen: SocketAddr,
+    },
     /// Apply the database schema.
     Migrate,
     /// Merchant administration.
@@ -122,10 +125,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             rb?;
             Ok(())
         }
-        Command::Worker => {
+        Command::Worker { listen } => {
             let config = Config::from_env(|k| std::env::var(k).ok())?;
             let app = Arc::new(App::new(store(4)?, config)?);
-            worker::run(app, shutdown_signal()).await
+            let l = tokio::net::TcpListener::bind(listen).await?;
+            tracing::info!(%listen, "worker metrics listening");
+            let server = axum::serve(l, api::worker_router(app.clone())).with_graceful_shutdown(shutdown_signal());
+            let (rw, rs) = tokio::join!(worker::run(app, shutdown_signal()), server);
+            rw?;
+            rs?;
+            Ok(())
         }
         Command::Migrate => {
             store(1)?.migrate().await?;

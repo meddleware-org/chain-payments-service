@@ -32,7 +32,8 @@ run() { # <name|--rm> <args...>
     -v "$PG_DIR/certs:/certs:ro" -v "$work:/cfg:ro" -e DATABASE_URL="$url" \
     -e METHODS_FILE=/cfg/methods.json -e QUOTE_KEY_FILE=/cfg/quote.key -e WEBHOOK_KEY_FILE=/cfg/webhook.key \
     -e SUI_GRPC_TESTNET=https://fullnode.testnet.sui.io:443 -e ALLOWED_ORIGINS=https://app.example.org \
-    -e PUBLIC_LISTEN_ADDR=127.0.0.1:18180 -e INTERNAL_LISTEN_ADDR=127.0.0.1:18181 "$image" "$@"
+    -e PUBLIC_LISTEN_ADDR=127.0.0.1:18180 -e INTERNAL_LISTEN_ADDR=127.0.0.1:18181 \
+    -e WORKER_LISTEN_ADDR=127.0.0.1:18182 "$image" "$@"
 }
 
 [ "$("$docker" image inspect --format '{{.Config.User}}' "$image")" = "65532:65532" ] || fail "image user"
@@ -47,4 +48,5 @@ curl -fs http://127.0.0.1:18180/v1/webhook-key | grep -q '"algorithm":"ed25519"'
 curl -fs http://127.0.0.1:18181/metrics | grep -q '^chain_payments_sessions_open 0' || fail "metrics"
 for _ in $(seq 1 20); do "$docker" logs cp-smoke-worker 2>&1 | grep -q 'worker running' && break; sleep 0.5; done
 "$docker" logs cp-smoke-worker 2>&1 | grep -q 'worker running' || fail "worker did not start"
+curl -fs http://127.0.0.1:18182/metrics | grep -q '^chain_payments_webhooks_delivered_total 0' || fail "worker metrics"
 echo "smoke: OK (${image})"

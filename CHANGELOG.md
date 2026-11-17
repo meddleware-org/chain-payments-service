@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.2 — 2026-11-17
 
 - **Unsubmitted payments are found** (FU-0124). The worker reads each package's `Paid` events through GraphQL
   (`SUI_GRAPHQL_<NETWORK>`, with defaults for testnet and mainnet), from a stored cursor. Every event that pays one of

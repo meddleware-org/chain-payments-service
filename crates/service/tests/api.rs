@@ -17,6 +17,12 @@ use tower::ServiceExt;
 const KEY: &str = "cpk_0123456789abcdef0123456789abcdef0123456789abcdef";
 
 async fn app() -> Option<Arc<App>> {
+    app_with("https://fullnode.testnet.sui.io:443").await
+}
+
+/// The app with its testnet full node at `grpc` (an unreachable address keeps every claim pending, offline).
+async fn app_with(grpc: &str) -> Option<Arc<App>> {
+    let grpc = grpc.to_string();
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
         assert!(std::env::var("REQUIRE_TEST_DATABASE").as_deref() != Ok("1"), "TEST_DATABASE_URL is required");
         eprintln!("SKIPPED: no TEST_DATABASE_URL");
@@ -48,7 +54,7 @@ async fn app() -> Option<Arc<App>> {
             "METHODS_FILE" => Some(dir.join("methods.json").display().to_string()),
             "QUOTE_KEY_FILE" => Some(dir.join("q.key").display().to_string()),
             "WEBHOOK_KEY_FILE" => Some(dir.join("w.key").display().to_string()),
-            "SUI_GRPC_TESTNET" => Some("https://fullnode.testnet.sui.io:443".into()),
+            "SUI_GRPC_TESTNET" => Some(grpc.clone()),
             "ALLOWED_ORIGINS" => Some("https://app.example.org".into()),
             "MAX_QUOTES_PER_SESSION" => Some("2".into()),
             _ => None,
@@ -156,4 +162,99 @@ async fn cors_only_for_configured_origins_and_no_cookies() {
     assert_eq!(v["algorithm"], "ed25519");
     assert!(h.get(header::SET_COOKIE).is_none());
     assert_eq!(h[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn unverifiable_claims_are_capped_per_session() {
+    // Nothing answers at 127.0.0.1:9, so every claim stays pending (an outage is retried, never decided).
+    let Some(app) = app_with("https://127.0.0.1:9").await else { return };
+    let m = merchant_router(app.clone());
+    let p = public_router(app.clone());
+    let (_, _, v) =
+        call(m, post("/v1/merchant/sessions", json!({"amountPence": 300, "description": "1 month"}), Some(KEY))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    let (_, _, q) =
+        call(p.clone(), post(&format!("/v1/sessions/{id}/quotes"), json!({"method": "sui-testnet:GBPT"}), None)).await;
+    let nonce = q["nonce"].as_str().unwrap().to_string();
+    // Well-formed digests (43 base58 characters) that no transaction has.
+    const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let digest = |i: u8| String::from_utf8(vec![B58[i as usize % B58.len()]; 43]).unwrap();
+    let claim =
+        |i: u8| post(&format!("/v1/sessions/{id}/payments"), json!({"nonce": nonce, "digest": digest(i)}), None);
+    for i in 1..=chain_payments_service::api::MAX_PENDING_CLAIMS as u8 {
+        let (st, _, r) = call(p.clone(), claim(i)).await;
+        assert_eq!((st, r["status"].as_str()), (StatusCode::OK, Some("pending")), "claim {i}");
+    }
+    let (st, _, _) = call(p.clone(), claim(99)).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "one claim beyond the cap");
+    assert!(app.store.payment(&digest(99), &nonce).await.unwrap().is_none(), "and it was withdrawn");
+    // A claim already known is answered as before, not counted again.
+    let (st, _, _) = call(p.clone(), claim(1)).await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_merchant_changed_on_chain_gets_no_quotes() {
+    let Some(app) = app().await else { return };
+    let m = merchant_router(app.clone());
+    let p = public_router(app.clone());
+    let (_, _, v) =
+        call(m, post("/v1/merchant/sessions", json!({"amountPence": 300, "description": "1 month"}), Some(KEY))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    let quote = || post(&format!("/v1/sessions/{id}/quotes"), json!({"method": "sui-testnet:GBPT"}), None);
+    // The worker read a pending recipient on the merchant object: quoting stops.
+    app.store
+        .record_merchant_watch("0x30b6", "0xa1", Some("0xbeef"), "aa", false, false, false, chrono::Utc::now())
+        .await
+        .unwrap();
+    let (st, _, e) = call(p.clone(), quote()).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(e["error"].as_str().unwrap().contains("pending"), "{e}");
+    // Back to normal: quotes again.
+    app.store
+        .record_merchant_watch("0x30b6", "0xa1", None, "aa", false, false, false, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(call(p.clone(), quote()).await.0, StatusCode::OK);
+    // The metrics show the watch.
+    let rows = app.store.merchant_watch_flags().await.unwrap();
+    let text = chain_payments_service::metrics::Metrics::render_watch(&rows);
+    assert!(text.contains("chain_payments_merchant_pending_recipient{merchant=\"0x30b6\"} 0"), "{text}");
+}
+
+#[tokio::test]
+async fn a_payment_no_checkout_submitted_is_found_from_its_event() {
+    let Some(app) = app().await else { return };
+    let m = merchant_router(app.clone());
+    let p = public_router(app.clone());
+    let (_, _, v) =
+        call(m, post("/v1/merchant/sessions", json!({"amountPence": 300, "description": "1 month"}), Some(KEY))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    let (_, _, q) =
+        call(p.clone(), post(&format!("/v1/sessions/{id}/quotes"), json!({"method": "sui-testnet:GBPT"}), None)).await;
+    let nonce = q["nonce"].as_str().unwrap().to_string();
+    use base64::Engine;
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+    // A stand-in GraphQL endpoint: one event pays our quote (never submitted), one is someone else's.
+    let digest = "33nefFTR2NG3LcCYzpnRjEsvu6gBTNhgMeDc9EyCqvFa";
+    let answer = json!({"data":{"events":{"pageInfo":{"hasNextPage":false,"endCursor":"C1"},"nodes":[
+        {"transaction":{"digest": digest},"contents":{"json":{"nonce": b64(&nonce)}}},
+        {"transaction":{"digest":"4JFuen7pDZCzqdRwUmB4oCwbeJ7Xqw5DqBsupvwyX1wb"},"contents":{"json":{"nonce": b64("ffffffffffffffffffffffffffffffff")}}}
+    ]}}});
+    let router = axum::Router::new().route("/graphql", axum::routing::post(move || async move { axum::Json(answer) }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/graphql", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    chain_payments_service::worker::reconcile_package(&app, &client, &url, "0x5f67").await.unwrap();
+    let claim = app.store.payment(digest, &nonce).await.unwrap().expect("claimed from the event");
+    assert_eq!(
+        (claim.session_id.as_str(), claim.status.as_str()),
+        (id.as_str(), "pending"),
+        "verified later like any claim"
+    );
+    assert_eq!(app.store.event_cursor("0x5f67").await.unwrap().as_deref(), Some("C1"));
+    // A second pass changes nothing.
+    chain_payments_service::worker::reconcile_package(&app, &client, &url, "0x5f67").await.unwrap();
+    assert!(!app.store.claim_found_payment(digest, &nonce).await.unwrap(), "once");
 }

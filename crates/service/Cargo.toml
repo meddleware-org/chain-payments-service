@@ -32,6 +32,7 @@ hex.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 http-body-util = "=0.1.5"
+base64.workspace = true
 sqlx.workspace = true
 chain-payments-store.workspace = true
 

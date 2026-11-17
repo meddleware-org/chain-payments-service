@@ -31,6 +31,14 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Quote vectors match chain-payments-sui
+        # fixtures/quote-vectors.json is a copy of the Move package's tests/vectors.json at this commit. A change on
+        # either side fails here until both are updated together (and this pin moved).
+        env:
+          VECTORS_COMMIT: e1d099d317ed143ab0f0230a35727ca6b9823df1
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/meddleware-org/chain-payments-sui/${VECTORS_COMMIT}/tests/vectors.json" -o /tmp/move-vectors.json
+          cmp /tmp/move-vectors.json fixtures/quote-vectors.json
       - name: Format check
         run: cargo fmt --check
 

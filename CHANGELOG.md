@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- **Unsubmitted payments are found** (FU-0124). The worker reads each package's `Paid` events through GraphQL
+  (`SUI_GRAPHQL_<NETWORK>`, with defaults for testnet and mainnet), from a stored cursor. Every event that pays one of
+  its quotes becomes a claim, verified through the full nodes like any other. The metric is
+  `chain_payments_payments_found_total`.
+- **Merchants are watched** (FU-0122). Every minute the worker reads each merchant object. A pending recipient, a
+  recipient other than `methods.json`'s new `recipient`, or a quote key other than this service's stops quoting for that
+  merchant. The gauges are `chain_payments_merchant_*`, and the alerts `ChainPaymentsMerchantChanged` and
+  `ChainPaymentsMerchantWatchStale`.
+- **Unverifiable claims are capped** (FU-0125). A session keeps at most 5 pending claims; one beyond the cap is withdrawn
+  with 429.
+- **Each process holds only its key** (FU-0126). `serve` needs `QUOTE_KEY_FILE` and `WEBHOOK_PUBLIC_KEY`; `worker` needs
+  `WEBHOOK_KEY_FILE` and `QUOTE_PUBLIC_KEY`. A public half that contradicts its key file is refused. The deployment
+  mounts each key alone, and merchants are read-only to the service's database role (provisioning's
+  `read_only_tables=merchants`), so the merchant Job uses the owner role.
+- **Negative quote vectors** (FU-0128) are refused, and CI compares `fixtures/quote-vectors.json` with
+  chain-payments-sui's at a pinned commit.
+- Migration 0004: `cp.event_cursors`, `cp.merchant_watch`.
+
 ## 0.0.1 — 2026-11-17 (first image)
 
 After the first pass of the security audit:

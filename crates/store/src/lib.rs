@@ -387,6 +387,134 @@ impl Store {
         Ok(if r.rows_affected() == 1 { Submitted::New } else { Submitted::AlreadyKnown })
     }
 
+    /// Where the worker has read a package's `Paid` events up to (a GraphQL cursor).
+    pub async fn event_cursor(&self, package_id: &str) -> Result<Option<String>, DbError> {
+        sqlx::query_scalar("SELECT cursor FROM cp.event_cursors WHERE package_id = $1")
+            .bind(package_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    pub async fn set_event_cursor(&self, package_id: &str, cursor: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO cp.event_cursors (package_id, cursor, updated_at) VALUES ($1, $2, now()) \
+             ON CONFLICT (package_id) DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()",
+        )
+        .bind(package_id)
+        .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A claim for an on-chain payment no checkout submitted: only for a nonce that is one of our quotes, and only once.
+    /// It is then settled like any other claim (verified through the full nodes).
+    pub async fn claim_found_payment(&self, digest: &str, nonce: &str) -> Result<bool, DbError> {
+        let r = sqlx::query(
+            "INSERT INTO cp.payments (digest, session_id, nonce) SELECT $1, q.session_id, q.nonce FROM cp.quotes q \
+             WHERE q.nonce = $2 ON CONFLICT (digest, nonce) DO NOTHING",
+        )
+        .bind(digest)
+        .bind(nonce)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// Records what the worker read of a merchant object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_merchant_watch(
+        &self,
+        merchant_object: &str,
+        recipient: &str,
+        pending_recipient: Option<&str>,
+        quote_key: &str,
+        paused: bool,
+        recipient_unexpected: bool,
+        quote_key_foreign: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO cp.merchant_watch (merchant_object, recipient, pending_recipient, quote_key, paused, \
+             recipient_unexpected, quote_key_foreign, checked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (merchant_object) DO UPDATE SET recipient = EXCLUDED.recipient, \
+             pending_recipient = EXCLUDED.pending_recipient, quote_key = EXCLUDED.quote_key, paused = EXCLUDED.paused, \
+             recipient_unexpected = EXCLUDED.recipient_unexpected, quote_key_foreign = EXCLUDED.quote_key_foreign, \
+             checked_at = EXCLUDED.checked_at",
+        )
+        .bind(merchant_object)
+        .bind(recipient)
+        .bind(pending_recipient)
+        .bind(quote_key)
+        .bind(paused)
+        .bind(recipient_unexpected)
+        .bind(quote_key_foreign)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Why quoting for a merchant object is held, if it is (a pending or unexpected recipient, a foreign quote key).
+    pub async fn merchant_hold(&self, merchant_object: &str) -> Result<Option<&'static str>, DbError> {
+        let r = sqlx::query(
+            "SELECT pending_recipient IS NOT NULL AS pending, recipient_unexpected, quote_key_foreign \
+             FROM cp.merchant_watch WHERE merchant_object = $1",
+        )
+        .bind(merchant_object)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(r) = r else { return Ok(None) };
+        Ok(if r.try_get::<bool, _>("quote_key_foreign")? {
+            Some("the merchant's quote key on-chain is not this service's")
+        } else if r.try_get::<bool, _>("recipient_unexpected")? {
+            Some("the merchant's recipient on-chain is not the expected one")
+        } else if r.try_get::<bool, _>("pending")? {
+            Some("a change of the merchant's recipient is pending")
+        } else {
+            None
+        })
+    }
+
+    /// Every watched merchant: (object, pending recipient, recipient unexpected, quote key foreign, seconds since read).
+    pub async fn merchant_watch_flags(&self) -> Result<Vec<(String, bool, bool, bool, i64)>, DbError> {
+        let rows = sqlx::query(
+            "SELECT merchant_object, pending_recipient IS NOT NULL AS pending, recipient_unexpected, quote_key_foreign, \
+             extract(epoch FROM now() - checked_at)::bigint AS age FROM cp.merchant_watch ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("merchant_object")?,
+                    r.try_get("pending")?,
+                    r.try_get("recipient_unexpected")?,
+                    r.try_get("quote_key_foreign")?,
+                    r.try_get("age")?,
+                ))
+            })
+            .collect()
+    }
+
+    /// How many claims of a session are still waiting for the chain.
+    pub async fn pending_claims(&self, session_id: &str) -> Result<i64, DbError> {
+        sqlx::query_scalar("SELECT count(*) FROM cp.payments WHERE session_id = $1 AND status = 'pending'")
+            .bind(session_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Withdraws a claim that is still pending (one beyond the per-session cap).
+    pub async fn withdraw_pending_claim(&self, digest: &str, nonce: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM cp.payments WHERE digest = $1 AND nonce = $2 AND status = 'pending'")
+            .bind(digest)
+            .bind(nonce)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn payment(&self, digest: &str, nonce: &str) -> Result<Option<Payment>, DbError> {
         let r = sqlx::query(
             "SELECT digest, session_id, nonce, status, payer, paid_until_ms, attempts FROM cp.payments \

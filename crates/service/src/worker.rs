@@ -50,7 +50,11 @@ async fn deliver(app: &Shared, client: &reqwest::Client, w: &Webhook) {
     };
     let body =
         serde_json::to_vec(&serde_json::json!({ "id": w.id, "event": w.event, "data": w.payload })).unwrap_or_default();
-    let sig = webhook::sign(&app.config.webhook_signer, now.timestamp() as u64, &body);
+    let Some(signer) = app.config.webhook_signer.as_ref() else {
+        tracing::error!("this process does not hold the webhook key; webhooks are left for the worker");
+        return;
+    };
+    let sig = webhook::sign(signer, now.timestamp() as u64, &body);
     let r = client
         .post(&url)
         .header("content-type", "application/json")
@@ -81,6 +85,16 @@ async fn deliver(app: &Shared, client: &reqwest::Client, w: &Webhook) {
     }
 }
 
+/// The client for GraphQL reads: no redirects, short timeouts.
+fn graphql_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("chain-payments/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()?)
+}
+
 /// One pass of every duty (also what the tests call).
 pub async fn tick(app: &Shared, client: &reqwest::Client) {
     let now = Utc::now();
@@ -107,6 +121,98 @@ pub async fn tick(app: &Shared, client: &reqwest::Client) {
     }
 }
 
+/// How often the slower duties (watching merchants, finding unsubmitted payments) run.
+pub const SLOW_DUTY_EVERY: Duration = Duration::from_secs(60);
+/// GraphQL pages read per package per pass (50 events each).
+const EVENT_PAGES_PER_PASS: usize = 5;
+
+/// Reads every registry merchant object and records its state; a pending recipient, an unexpected recipient or a
+/// foreign quote key holds quoting for that merchant (`Store::merchant_hold`). A merchant the nodes cannot read (or
+/// disagree about) is marked unexpected too: an unknown state is not a known-good one.
+pub async fn watch_merchants(app: &Shared) {
+    let mut seen = std::collections::BTreeSet::new();
+    for m in &app.config.registry.methods {
+        if !seen.insert(m.merchant_object.clone()) {
+            continue;
+        }
+        let Some(chain) = app.chains.get(&m.network) else { continue };
+        let now = Utc::now();
+        let r = match chain.merchant_state(&m.merchant_object).await {
+            Ok(st) => {
+                let unexpected = m
+                    .recipient
+                    .as_deref()
+                    .is_some_and(|want| chain_payments_chain_sui::normalize(want) != st.recipient);
+                let foreign = st.quote_key != app.config.quote_public;
+                if unexpected || foreign || st.pending_recipient.is_some() {
+                    tracing::error!(merchant = %m.merchant_object, ?st, unexpected, foreign, "merchant changed on-chain");
+                }
+                app.store
+                    .record_merchant_watch(
+                        &m.merchant_object,
+                        &st.recipient,
+                        st.pending_recipient.as_deref(),
+                        &st.quote_key,
+                        st.paused,
+                        unexpected,
+                        foreign,
+                        now,
+                    )
+                    .await
+            }
+            Err(e) => {
+                tracing::error!(merchant = %m.merchant_object, error = %e, "merchant unreadable");
+                app.store.record_merchant_watch(&m.merchant_object, "?", None, "?", false, true, false, now).await
+            }
+        };
+        if let Err(e) = r {
+            tracing::error!(error = %e, "record merchant watch");
+        }
+    }
+}
+
+/// Finds `Paid` events of each registry package that no checkout submitted (a closed tab, a failed submission) and
+/// claims them; the next tick verifies each through the full nodes like any other claim.
+pub async fn reconcile(app: &Shared, client: &reqwest::Client) {
+    let mut seen = std::collections::BTreeSet::new();
+    for m in &app.config.registry.methods {
+        if !seen.insert(m.package_id.clone()) {
+            continue;
+        }
+        let Some(url) = app.config.graphql.get(&m.network) else { continue };
+        if let Err(e) = reconcile_package(app, client, url, &m.package_id).await {
+            tracing::warn!(package = %m.package_id, error = %e, "reconcile");
+        }
+    }
+}
+
+/// [`reconcile`] for one package and endpoint (also what the tests call).
+pub async fn reconcile_package(
+    app: &Shared,
+    client: &reqwest::Client,
+    url: &str,
+    package_id: &str,
+) -> anyhow::Result<()> {
+    let mut cursor = app.store.event_cursor(package_id).await?;
+    for _ in 0..EVENT_PAGES_PER_PASS {
+        let page = chain_payments_chain_sui::paid_events(client, url, package_id, cursor.as_deref()).await?;
+        for e in &page.events {
+            if app.store.claim_found_payment(&e.digest, &e.nonce).await? {
+                Metrics::inc(&app.metrics.payments_found);
+                tracing::info!(digest = %e.digest, "found a payment no checkout submitted");
+            }
+        }
+        if let Some(c) = &page.end_cursor {
+            app.store.set_event_cursor(package_id, c).await?;
+            cursor = Some(c.clone());
+        }
+        if !page.has_next {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Runs until `stop` resolves, holding the single-writer lock.
 pub async fn run(app: Shared, stop: impl std::future::Future<Output = ()>) -> anyhow::Result<()> {
     let client = webhook_client()?;
@@ -123,8 +229,15 @@ pub async fn run(app: Shared, stop: impl std::future::Future<Output = ()>) -> an
         }
     };
     tracing::info!("worker running");
+    let chain_client = graphql_client()?;
+    let mut last_slow: Option<std::time::Instant> = None;
     loop {
         tick(&app, &client).await;
+        if last_slow.is_none_or(|t| t.elapsed() >= SLOW_DUTY_EVERY) {
+            watch_merchants(&app).await;
+            reconcile(&app, &chain_client).await;
+            last_slow = Some(std::time::Instant::now());
+        }
         tokio::select! {
             _ = &mut stop => return Ok(()),
             _ = tokio::time::sleep(Duration::from_secs(3)) => {}

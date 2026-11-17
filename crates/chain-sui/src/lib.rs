@@ -10,12 +10,13 @@
 use std::time::Duration;
 
 use access_gate_gateway_core::chain::{
-    EVENT_JSON, EVENT_SENDER, EVENT_TYPE, EVENTS_EVENTS, EXECUTED_EVENTS, LEDGER_GET_TRANSACTION, RESP_TRANSACTION,
-    build_get_transaction, effects_succeeded,
+    EVENT_JSON, EVENT_SENDER, EVENT_TYPE, EVENTS_EVENTS, EXECUTED_EVENTS, FIELDMASK_PATHS, GO_OBJECT, GO_OBJECT_ID,
+    GO_READ_MASK, LEDGER_GET_OBJECT, LEDGER_GET_TRANSACTION, OBJECT_JSON, RESP_TRANSACTION, build_get_transaction,
+    effects_succeeded,
 };
 use access_gate_gateway_core::grpc::{
-    Field, GRPC_NOT_FOUND, GrpcStatus, GrpcWeb, MAX_GRPC_MESSAGE_BYTES, ProtoReader, Transport, field_bytes, field_str,
-    value_find_string,
+    Field, GRPC_NOT_FOUND, GrpcStatus, GrpcWeb, MAX_GRPC_MESSAGE_BYTES, ProtoReader, ProtoWriter, Transport,
+    field_bytes, field_str, value_as_bool, value_field, value_find_string,
 };
 use access_gate_gateway_core::sig::{normalize_address, normalize_move_type};
 use base64::Engine;
@@ -166,6 +167,30 @@ impl<T: Transport> Sui<T> {
         agree(answers)
     }
 
+    /// A merchant object's governance state as every configured node reports it. Nodes that disagree are an error (the
+    /// caller treats an unknown state as a reason to stop quoting).
+    pub async fn merchant_state(&self, object_id: &str) -> anyhow::Result<MerchantState> {
+        let mut mask = ProtoWriter::new();
+        mask.string_field(FIELDMASK_PATHS, "json");
+        let mut req = ProtoWriter::new();
+        req.string_field(GO_OBJECT_ID, object_id);
+        req.bytes_field(GO_READ_MASK, &mask.into_bytes());
+        let req = req.into_bytes();
+        let mut seen: Option<MerchantState> = None;
+        for node in &self.nodes {
+            let resp = node.call(LEDGER_GET_OBJECT, req.clone()).await?;
+            let state = field_bytes(&resp, GO_OBJECT)
+                .and_then(|o| field_bytes(o, OBJECT_JSON))
+                .and_then(parse_merchant)
+                .ok_or_else(|| anyhow::anyhow!("{object_id} is not a readable merchant object"))?;
+            match &seen {
+                Some(s) if *s != state => anyhow::bail!("the full nodes disagree about merchant {object_id}"),
+                _ => seen = Some(state),
+            }
+        }
+        seen.ok_or_else(|| anyhow::anyhow!("no full node configured"))
+    }
+
     async fn ask(node: &GrpcWeb<T>, digest: &str, expected: &Expected<'_>) -> Result<Confirmed, VerifyError> {
         let resp = match node.call(LEDGER_GET_TRANSACTION, build_get_transaction(digest)).await {
             Ok(r) => r,
@@ -220,6 +245,107 @@ pub fn agree(answers: Vec<Result<Confirmed, VerifyError>>) -> Result<Confirmed, 
     } else {
         Err(VerifyError::Rpc(anyhow::anyhow!("the full nodes disagree about this transaction")))
     }
+}
+
+/// An address in the full-node form (lowercase, 64 hex digits).
+pub fn normalize(address: &str) -> String {
+    normalize_address(address)
+}
+
+/// A merchant's governance fields, as the package stores them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerchantState {
+    pub recipient: String,
+    pub pending_recipient: Option<String>,
+    /// The quote key, lowercase hex.
+    pub quote_key: String,
+    pub paused: bool,
+}
+
+/// The string of a `google.protobuf.Value` (field 3), if it holds one.
+fn value_string(v: &[u8]) -> Option<String> {
+    field_str(v, 3).map(str::to_string)
+}
+
+/// Reads a `Merchant` object's JSON (a `google.protobuf.Value`): its own top-level fields only.
+pub fn parse_merchant(json: &[u8]) -> Option<MerchantState> {
+    let recipient = normalize_address(&value_string(value_field(json, "recipient")?)?);
+    let quote_key = b64(&value_string(value_field(json, "quote_key")?)?).filter(|k| k.len() == 32)?;
+    let paused = value_as_bool(value_field(json, "paused")?)?;
+    // An Option is null (absent struct) or the struct itself.
+    let pending_recipient = value_field(json, "pending_recipient")
+        .and_then(|p| value_field(p, "recipient"))
+        .and_then(value_string)
+        .map(|r| normalize_address(&r));
+    Some(MerchantState {
+        recipient,
+        pending_recipient,
+        quote_key: quote_key.iter().map(|b| format!("{b:02x}")).collect(),
+        paused,
+    })
+}
+
+/// One `Paid` event found through GraphQL: a candidate claim, still verified through the full nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaidEvent {
+    pub digest: String,
+    pub nonce: String,
+}
+
+/// A page of a package's `Paid` events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaidPage {
+    pub events: Vec<PaidEvent>,
+    pub end_cursor: Option<String>,
+    pub has_next: bool,
+}
+
+const PAID_EVENTS_QUERY: &str = "query($t:String!,$after:String){events(first:50,after:$after,filter:{type:$t}){pageInfo{hasNextPage endCursor}nodes{transaction{digest}contents{json}}}}";
+
+/// Reads a page of `<package>::chain_payments::Paid` events after `after` from a Sui GraphQL endpoint.
+pub async fn paid_events(
+    client: &reqwest::Client,
+    url: &str,
+    package_id: &str,
+    after: Option<&str>,
+) -> anyhow::Result<PaidPage> {
+    let body = serde_json::json!({
+        "query": PAID_EVENTS_QUERY,
+        "variables": { "t": format!("{package_id}::chain_payments::Paid"), "after": after },
+    });
+    let resp = client.post(url).json(&body).send().await?;
+    anyhow::ensure!(resp.status().is_success(), "GraphQL HTTP {}", resp.status());
+    let v: serde_json::Value = resp.json().await?;
+    parse_paid_page(&v)
+}
+
+/// Parses a GraphQL answer to [`paid_events`]. Events whose digest or nonce cannot be read are skipped (they cannot be
+/// one of our quotes); a GraphQL error is an error.
+pub fn parse_paid_page(v: &serde_json::Value) -> anyhow::Result<PaidPage> {
+    if let Some(e) = v.get("errors").and_then(|e| e.as_array()).filter(|e| !e.is_empty()) {
+        anyhow::bail!("GraphQL: {}", e[0]["message"].as_str().unwrap_or("error"));
+    }
+    let ev = &v["data"]["events"];
+    anyhow::ensure!(ev.is_object(), "GraphQL: no events in the answer");
+    let events = ev["nodes"]
+        .as_array()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| {
+                    let digest = n["transaction"]["digest"].as_str().filter(|d| is_digest(d))?.to_string();
+                    let nonce = n["contents"]["json"]["nonce"].as_str().and_then(b64)?;
+                    let nonce = String::from_utf8(nonce).ok().filter(|s| s.len() == 32)?;
+                    Some(PaidEvent { digest, nonce })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(PaidPage {
+        events,
+        end_cursor: ev["pageInfo"]["endCursor"].as_str().map(str::to_string),
+        has_next: ev["pageInfo"]["hasNextPage"].as_bool().unwrap_or(false),
+    })
 }
 
 fn b64(s: &str) -> Option<Vec<u8>> {
@@ -282,6 +408,80 @@ mod tests {
 
     fn ok(payer: &str) -> Result<Confirmed, VerifyError> {
         Ok(Confirmed { payer: payer.into(), amount: 5, units: 1, paid_until_ms: 9, platform_fee: 0 })
+    }
+
+    fn value_str(s: &str) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.string_field(3, s);
+        w.into_bytes()
+    }
+    fn value_bool(b: bool) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.uint_field(4, b as u64);
+        w.into_bytes()
+    }
+    fn value_null() -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.uint_field(1, 0);
+        w.into_bytes()
+    }
+    fn value_struct(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut st = ProtoWriter::new();
+        for (k, v) in fields {
+            let mut e = ProtoWriter::new();
+            e.string_field(1, k);
+            e.bytes_field(2, v);
+            st.bytes_field(1, &e.into_bytes());
+        }
+        let mut w = ProtoWriter::new();
+        w.bytes_field(5, &st.into_bytes());
+        w.into_bytes()
+    }
+
+    #[test]
+    fn merchant_objects_are_read_by_their_own_fields() {
+        let key = STANDARD.encode([7u8; 32]);
+        let pending = value_struct(&[("recipient", value_str("0xBEEF")), ("effective_ms", value_str("5"))]);
+        let json = value_struct(&[
+            ("pending_recipient", pending),
+            ("recipient", value_str("0x00a1")),
+            ("quote_key", value_str(&key)),
+            ("paused", value_bool(false)),
+        ]);
+        let m = parse_merchant(&json).unwrap();
+        assert_eq!(m.recipient, normalize_address("0xa1"), "the merchant's own recipient, not the pending one");
+        assert_eq!(m.pending_recipient, Some(normalize_address("0xbeef")));
+        assert_eq!(m.quote_key, "07".repeat(32));
+        assert!(!m.paused);
+        let none = value_struct(&[
+            ("pending_recipient", value_null()),
+            ("recipient", value_str("0xa1")),
+            ("quote_key", value_str(&key)),
+            ("paused", value_bool(true)),
+        ]);
+        let m = parse_merchant(&none).unwrap();
+        assert_eq!((m.pending_recipient, m.paused), (None, true));
+        assert!(parse_merchant(&value_struct(&[("recipient", value_str("0xa1"))])).is_none(), "fields missing");
+    }
+
+    #[test]
+    fn paid_events_from_graphql() {
+        // The shape testnet's GraphQL returned on 2026-11-17 for the live payment.
+        let v = serde_json::json!({"data":{"events":{"pageInfo":{"hasNextPage":true,"endCursor":"CUR"},"nodes":[
+            {"transaction":{"digest":"33nefFTR2NG3LcCYzpnRjEsvu6gBTNhgMeDc9EyCqvFa"},
+             "contents":{"json":{"nonce":"ZmFlZmVjOGMwNWFiYjMwMjA5YWM0ZmYzNzM0NjkyODI=","amount":"17971067"}}},
+            {"transaction":{"digest":"not a digest"},"contents":{"json":{"nonce":"eA=="}}}
+        ]}}});
+        let p = parse_paid_page(&v).unwrap();
+        assert_eq!(
+            p.events,
+            vec![PaidEvent {
+                digest: "33nefFTR2NG3LcCYzpnRjEsvu6gBTNhgMeDc9EyCqvFa".into(),
+                nonce: "faefec8c05abb30209ac4ff373469282".into(),
+            }]
+        );
+        assert_eq!((p.end_cursor.as_deref(), p.has_next), (Some("CUR"), true));
+        assert!(parse_paid_page(&serde_json::json!({"errors":[{"message":"bad"}]})).is_err());
     }
 
     #[test]
@@ -366,5 +566,10 @@ mod tests {
         let sui = Sui::new(&["https://fullnode.testnet.sui.io:443".to_string()], Duration::from_secs(15)).unwrap();
         let c = sui.verify_payment(DIGEST, &expected()).await.unwrap();
         assert_eq!(c.amount, 1000);
+        // Merchant #1 of the current testnet package (deployments.json): its live governance fields.
+        let m = sui.merchant_state("0x1015d740c7f4261bae407bf62559eea4e6f76a97377c7149febf49ac9520d814").await.unwrap();
+        assert_eq!(m.recipient, "0xa991ae11b0785718cd3ad1c616e804a4c083f431b3144bb845bdec651164864a");
+        assert_eq!(m.quote_key, "c80751d89f3e5391037039de90118c553e7b3f00109c71badd33cc4910482e8c");
+        assert_eq!((m.pending_recipient, m.paused), (None, false));
     }
 }

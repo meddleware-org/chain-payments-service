@@ -45,6 +45,8 @@ pub enum OpError {
     Refused(String),
     #[error("no price is available right now; try again shortly")]
     NoPrice,
+    #[error("too many payments are being checked for this checkout; try again shortly")]
+    TooManyClaims,
     #[error("storage: {0}")]
     Store(#[from] chain_payments_store::DbError),
 }
@@ -87,6 +89,11 @@ impl App {
             return Err(OpError::Refused("this payment method is not offered for this checkout".into()));
         }
         let m = self.method(method_id).ok_or_else(|| OpError::Refused("unknown payment method".into()))?;
+        // A merchant whose recipient or quote key changed on-chain (or is about to) gets no quotes until it is checked.
+        if let Some(why) = self.store.merchant_hold(&m.merchant_object).await? {
+            tracing::warn!(merchant = %m.merchant_object, why, "quote refused");
+            return Err(OpError::Refused(format!("payments to this merchant are paused: {why}")));
+        }
         if self.store.count_quotes(session_id).await? >= self.config.max_quotes_per_session {
             return Err(OpError::Refused("too many quotes for this checkout; start a new one".into()));
         }
@@ -128,8 +135,13 @@ impl App {
             expires_ms,
             nonce: nonce.clone(),
         };
-        let signature =
-            self.config.quote_signer.sign_quote(&fields).map_err(|e| OpError::Refused(format!("cannot sign: {e}")))?;
+        let signature = self
+            .config
+            .quote_signer
+            .as_ref()
+            .ok_or_else(|| OpError::Refused("this process does not hold the quote key".into()))?
+            .sign_quote(&fields)
+            .map_err(|e| OpError::Refused(format!("cannot sign: {e}")))?;
         self.store
             .insert_quote(&Quote {
                 nonce: nonce.clone(),

@@ -19,8 +19,18 @@ pub enum ConfigError {
 
 pub struct Config {
     pub registry: Registry,
-    pub quote_signer: Signer,
-    pub webhook_signer: Signer,
+    /// The quote signing key: only the API (`serve`) holds it (`QUOTE_KEY_FILE`).
+    pub quote_signer: Option<Signer>,
+    /// The quote key's public half (hex): from the signer, or `QUOTE_PUBLIC_KEY` where the key is not held (the worker
+    /// compares it with each merchant's on-chain key).
+    pub quote_public: String,
+    /// The webhook signing key: only the worker holds it (`WEBHOOK_KEY_FILE`).
+    pub webhook_signer: Option<Signer>,
+    /// The webhook key's public half (hex): from the signer, or `WEBHOOK_PUBLIC_KEY` (the API publishes it).
+    pub webhook_public: String,
+    /// GraphQL endpoint per network (`SUI_GRAPHQL_TESTNET`, …), used only to find `Paid` events no checkout submitted;
+    /// every candidate is still verified through the full nodes above.
+    pub graphql: HashMap<String, String>,
     /// Full node gRPC base URLs per network (`SUI_GRPC_TESTNET`, `SUI_GRPC_MAINNET`, …; comma-separated). Mainnet needs
     /// two nodes on different hosts, run by different operators: a payment counts only when both report it the same way.
     pub grpc: HashMap<String, Vec<String>>,
@@ -73,12 +83,33 @@ impl Config {
         let methods_file = get("METHODS_FILE").ok_or(ConfigError::Missing("METHODS_FILE"))?;
         let bytes = std::fs::read(&methods_file).map_err(|e| ConfigError::Invalid("METHODS_FILE", e.to_string()))?;
         let registry = Registry::from_json(&bytes).map_err(|e| ConfigError::Invalid("METHODS_FILE", e.to_string()))?;
-        let quote_signer = read_seed("QUOTE_KEY_FILE", &get)?;
-        let webhook_signer = read_seed("WEBHOOK_KEY_FILE", &get)?;
-        if quote_signer.public_hex() == webhook_signer.public_hex() {
+        // Each process holds only the key it signs with, and the other one's public half.
+        let quote_signer = get("QUOTE_KEY_FILE").map(|_| read_seed("QUOTE_KEY_FILE", &get)).transpose()?;
+        let webhook_signer = get("WEBHOOK_KEY_FILE").map(|_| read_seed("WEBHOOK_KEY_FILE", &get)).transpose()?;
+        let public = |var: &'static str, signer: &Option<Signer>, file: &'static str| -> Result<String, ConfigError> {
+            match (signer, get(var)) {
+                (Some(s), Some(p)) if !p.trim().eq_ignore_ascii_case(&s.public_hex()) => {
+                    Err(ConfigError::Invalid(var, format!("does not match {file}")))
+                }
+                (Some(s), _) => Ok(s.public_hex()),
+                (None, Some(p)) => {
+                    let p = p.trim().to_ascii_lowercase();
+                    if p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        Ok(p)
+                    } else {
+                        Err(ConfigError::Invalid(var, "64 hex characters".into()))
+                    }
+                }
+                (None, None) => Err(ConfigError::Invalid(var, format!("set {file} or {var}"))),
+            }
+        };
+        let quote_public = public("QUOTE_PUBLIC_KEY", &quote_signer, "QUOTE_KEY_FILE")?;
+        let webhook_public = public("WEBHOOK_PUBLIC_KEY", &webhook_signer, "WEBHOOK_KEY_FILE")?;
+        if quote_public == webhook_public {
             return Err(ConfigError::Invalid("WEBHOOK_KEY_FILE", "must differ from the quote key".into()));
         }
         let mut grpc = HashMap::new();
+        let mut graphql = HashMap::new();
         for m in &registry.methods {
             let var = format!("SUI_GRPC_{}", m.network.to_ascii_uppercase());
             let raw =
@@ -110,6 +141,19 @@ impl Config {
                 ));
             }
             grpc.insert(m.network.clone(), urls);
+            let gvar = format!("SUI_GRAPHQL_{}", m.network.to_ascii_uppercase());
+            let default = match m.network.as_str() {
+                "testnet" => Some("https://graphql.testnet.sui.io/graphql"),
+                "mainnet" => Some("https://graphql.mainnet.sui.io/graphql"),
+                _ => None,
+            };
+            if let Some(g) = get(&gvar).or(default.map(String::from)) {
+                let ok = g.starts_with("https://") || (m.network == "localnet" && g.starts_with("http://127.0.0.1:"));
+                if !ok {
+                    return Err(ConfigError::Invalid("SUI_GRAPHQL_<NETWORK>", format!("{gvar} must be https")));
+                }
+                graphql.insert(m.network.clone(), g);
+            }
         }
         let sources: Vec<Source> = get("PRICE_SOURCES")
             .unwrap_or_else(|| "kraken,coinbase,coingecko".into())
@@ -147,7 +191,10 @@ impl Config {
         Ok(Self {
             registry,
             quote_signer,
+            quote_public,
             webhook_signer,
+            webhook_public,
+            graphql,
             grpc,
             sources,
             gecko_ids,
@@ -220,6 +267,36 @@ mod tests {
         ] {
             assert!(Config::from_env(env(&d, &extra)).is_err(), "{extra:?}");
         }
+    }
+
+    #[test]
+    fn each_process_holds_only_its_own_key() {
+        let d = dir("keys");
+        let q = env(&d, &[]);
+        let full = Config::from_env(&q).unwrap();
+        let (qp, wp) = (full.quote_public.clone(), full.webhook_public.clone());
+        // The API: the quote key and the webhook's public half.
+        let api = Config::from_env(|k: &str| match k {
+            "WEBHOOK_KEY_FILE" => None,
+            "WEBHOOK_PUBLIC_KEY" => Some(wp.clone()),
+            _ => q(k),
+        })
+        .unwrap();
+        assert!(api.quote_signer.is_some() && api.webhook_signer.is_none());
+        assert_eq!(api.webhook_public, wp);
+        // The worker: the webhook key and the quote key's public half.
+        let worker = Config::from_env(|k: &str| match k {
+            "QUOTE_KEY_FILE" => None,
+            "QUOTE_PUBLIC_KEY" => Some(qp.clone()),
+            _ => q(k),
+        })
+        .unwrap();
+        assert!(worker.quote_signer.is_none() && worker.webhook_signer.is_some());
+        // Neither half: refused; a public half that contradicts the key file: refused.
+        assert!(Config::from_env(|k: &str| if k == "QUOTE_KEY_FILE" { None } else { q(k) }).is_err());
+        assert!(
+            Config::from_env(|k: &str| if k == "QUOTE_PUBLIC_KEY" { Some("00".repeat(32)) } else { q(k) }).is_err()
+        );
     }
 
     #[test]

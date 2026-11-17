@@ -118,6 +118,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { public, internal, pool } => {
             let config = Config::from_env(|k| std::env::var(k).ok())?;
+            anyhow::ensure!(config.quote_signer.is_some(), "serve signs quotes: set QUOTE_KEY_FILE");
             let app = Arc::new(App::new(store(pool)?, config)?);
             let pl = tokio::net::TcpListener::bind(public).await?;
             let il = tokio::net::TcpListener::bind(internal).await?;
@@ -131,6 +132,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Worker { listen } => {
             let config = Config::from_env(|k| std::env::var(k).ok())?;
+            anyhow::ensure!(config.webhook_signer.is_some(), "the worker signs webhooks: set WEBHOOK_KEY_FILE");
             let app = Arc::new(App::new(store(4)?, config)?);
             let l = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(%listen, "worker metrics listening");

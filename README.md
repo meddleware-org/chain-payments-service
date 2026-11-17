@@ -35,6 +35,13 @@ package sent to the platform treasury; the recipient received the rest) (the sam
 that was already paid or cancelled. The coins are the merchant's; the merchant credits the buyer or refunds them by hand.
 Nothing is refunded automatically, so paying stale quotes cannot make a merchant spend network fees.
 
+Keys: `serve` holds the quote key (`QUOTE_KEY_FILE`) and publishes the webhook key from `WEBHOOK_PUBLIC_KEY`; the worker
+holds the webhook key (`WEBHOOK_KEY_FILE`) and compares merchants with `QUOTE_PUBLIC_KEY`.
+
+The worker also reads each merchant object every minute and stops quoting for a merchant whose recipient is pending or
+unexpected (`methods.json` `recipient`), or whose quote key is not this service's. It finds `Paid` events that no
+checkout submitted through `SUI_GRAPHQL_<NETWORK>`, and verifies them like any claim.
+
 Full nodes: `SUI_GRPC_<NETWORK>` is one URL or a comma-separated list on different hosts. With several, a payment counts
 only when every node reports it the same way; mainnet requires two, from different operators.
 

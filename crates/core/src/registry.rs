@@ -24,6 +24,10 @@ pub struct Method {
     pub package_id: String,
     /// The merchant object on-chain that payments with this method go to.
     pub merchant_object: String,
+    /// The address the merchant object must pay (its `recipient`). The worker compares it with the chain: a different or
+    /// a pending recipient stops quoting for the merchant. Absent: only a pending recipient stops it.
+    #[serde(default)]
+    pub recipient: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -39,6 +39,7 @@ impl IntoResponse for OpError {
             OpError::NotFound => error(StatusCode::NOT_FOUND, "not found"),
             OpError::Refused(m) => error(StatusCode::CONFLICT, &m),
             OpError::NoPrice => error(StatusCode::SERVICE_UNAVAILABLE, &self.to_string()),
+            OpError::TooManyClaims => error(StatusCode::TOO_MANY_REQUESTS, &self.to_string()),
             OpError::Store(e) => {
                 tracing::error!(error = %e, "storage");
                 error(StatusCode::SERVICE_UNAVAILABLE, "storage is unavailable")
@@ -97,6 +98,9 @@ struct PaymentRequest {
     digest: String,
 }
 
+/// Claims a session may have waiting for the chain at once (a real payment is usually final within seconds).
+pub const MAX_PENDING_CLAIMS: i64 = 5;
+
 async fn post_payment(
     State(app): State<Shared>,
     Path(id): Path<String>,
@@ -109,10 +113,19 @@ async fn post_payment(
     if q.session_id != id {
         return Err(OpError::NotFound);
     }
-    app.store.submit_payment(&r.digest, &id, &r.nonce).await?;
+    let submitted = app.store.submit_payment(&r.digest, &id, &r.nonce).await?;
     Metrics::inc(&app.metrics.payments_submitted);
     // One immediate check (the transaction is usually final already); the watcher retries a pending one.
     let status = app.settle(&r.digest, &r.nonce).await?;
+    // Anyone who knows a session id can post well-formed digests; each one the chain does not know yet is re-checked
+    // for an hour. A new claim still pending beyond the cap is withdrawn, so they cannot pile up.
+    if status == "pending"
+        && submitted == chain_payments_store::Submitted::New
+        && app.store.pending_claims(&id).await? > MAX_PENDING_CLAIMS
+    {
+        app.store.withdraw_pending_claim(&r.digest, &r.nonce).await?;
+        return Err(OpError::TooManyClaims);
+    }
     Ok(Json(json!({ "digest": r.digest, "status": status })).into_response())
 }
 
@@ -128,7 +141,7 @@ async fn get_payment(
 }
 
 async fn webhook_key(State(app): State<Shared>) -> Response {
-    Json(json!({ "algorithm": "ed25519", "publicKey": app.config.webhook_signer.public_hex(), "header": chain_payments_core::webhook::HEADER })).into_response()
+    Json(json!({ "algorithm": "ed25519", "publicKey": app.config.webhook_public, "header": chain_payments_core::webhook::HEADER })).into_response()
 }
 
 async fn healthz() -> &'static str {
@@ -282,7 +295,11 @@ async fn cancel_session(State(app): State<Shared>, headers: HeaderMap, Path(id):
 
 async fn metrics(State(app): State<Shared>) -> Response {
     let backlog = app.store.backlog().await.ok();
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], app.metrics.render(backlog)).into_response()
+    let mut body = app.metrics.render(backlog);
+    if let Ok(rows) = app.store.merchant_watch_flags().await {
+        body.push_str(&crate::metrics::Metrics::render_watch(&rows));
+    }
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 pub fn merchant_router(app: Shared) -> Router {

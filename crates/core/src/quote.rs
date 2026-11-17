@@ -167,6 +167,33 @@ mod tests {
     }
 
     #[test]
+    fn every_shared_negative_vector_is_refused() {
+        // The Move repo's negative vectors (a valid signature with one field changed, or truncated): this side builds
+        // each message from its fields and refuses the signature, as `pay` does on-chain.
+        let v: Value = serde_json::from_str(include_str!("../../../fixtures/quote-vectors.json")).unwrap();
+        let public = hex::decode(v["publicKey"].as_str().unwrap()).unwrap();
+        let negative = v["negative"].as_object().expect("negative vectors");
+        assert_eq!(negative.len(), 10);
+        for (name, q) in negative {
+            let fields = QuoteFields {
+                merchant_id: q["merchant"].as_str().unwrap().into(),
+                session: q["session"].as_str().unwrap().into(),
+                coin_type: q["coinType"].as_str().unwrap().into(),
+                amount: q["amount"].as_u64().unwrap(),
+                units: q["units"].as_u64().unwrap(),
+                period_ms: q["periodMs"].as_u64().unwrap(),
+                subscription_ref: q["subscriptionRef"].as_str().unwrap().into(),
+                expires_ms: q["expiresMs"].as_u64().unwrap(),
+                nonce: q["nonce"].as_str().unwrap().into(),
+            };
+            let msg = fields.message().unwrap();
+            assert_eq!(hex::encode(&msg), q["message"], "{name}: the same message on both sides");
+            let sig = hex::decode(q["signature"].as_str().unwrap()).unwrap();
+            assert!(!verify(&public, &msg, &sig), "{name} must not verify");
+        }
+    }
+
+    #[test]
     fn canonical_coin_types() {
         assert_eq!(
             canonical_coin_type("0x2::sui::SUI").unwrap(),

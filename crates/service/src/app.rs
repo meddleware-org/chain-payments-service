@@ -189,10 +189,10 @@ impl App {
                     tracing::info!(session = %q.session_id, %digest, "payment confirmed");
                     Ok("confirmed".into())
                 }
-                Settled::NotOpen => {
-                    Metrics::inc(&self.metrics.payments_rejected);
-                    tracing::warn!(session = %q.session_id, %digest, "paid on-chain for a session that was no longer open");
-                    Ok("rejected".into())
+                Settled::Unapplied => {
+                    Metrics::inc(&self.metrics.payments_unapplied);
+                    tracing::warn!(session = %q.session_id, %digest, "paid on-chain for a session that was no longer open; the merchant is told");
+                    Ok("unapplied".into())
                 }
                 // The other process's outcome stands (and was counted there).
                 Settled::Already(status) => Ok(status),

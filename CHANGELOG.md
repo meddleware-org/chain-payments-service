@@ -2,6 +2,9 @@
 
 ## Unreleased (first pass of the security audit, 2026-11-17; ships in the first tag, 0.0.1)
 
+- A payment for a session already paid or cancelled is `unapplied` (not `rejected`) and the merchant gets a
+  `payment.unapplied` webhook in the same transaction (migration 0003).
+- Several full nodes per network, which must agree before a payment counts; mainnet requires two on different hosts.
 - A payment record is a claim `(digest, nonce)` (migration 0002): anyone who read a `Paid` event could submit its digest
   against another quote of the session first and leave the real payment unrecognised; claims are now independent.
   `GET /v1/sessions/{id}/payments/{digest}` reports the best status among the session's claims of that digest.

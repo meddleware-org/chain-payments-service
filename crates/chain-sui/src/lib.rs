@@ -125,26 +125,46 @@ pub fn is_digest(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
 }
 
+/// One or more full nodes of one network. With more than one, a payment counts only when every node reports it the same
+/// way: a node that is wrong (or lying) can then neither credit a payment that did not happen nor make a real one look
+/// rejected; a disagreement is reported as an RPC problem, so the payment is retried and the disagreement is logged.
 pub struct Sui<T: Transport> {
-    grpc: GrpcWeb<T>,
+    nodes: Vec<GrpcWeb<T>>,
 }
 
 impl Sui<HttpTransport> {
-    pub fn new(fullnode_url: &str, timeout: Duration) -> anyhow::Result<Self> {
-        Ok(Self { grpc: GrpcWeb::new(HttpTransport::new(timeout)?, fullnode_url.to_string()) })
+    pub fn new(fullnode_urls: &[String], timeout: Duration) -> anyhow::Result<Self> {
+        anyhow::ensure!(!fullnode_urls.is_empty(), "at least one full node");
+        let nodes = fullnode_urls
+            .iter()
+            .map(|u| Ok(GrpcWeb::new(HttpTransport::new(timeout)?, u.clone())))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self { nodes })
     }
 }
 
 impl<T: Transport> Sui<T> {
     pub fn with_transport(transport: T, fullnode_url: &str) -> Self {
-        Self { grpc: GrpcWeb::new(transport, fullnode_url.to_string()) }
+        Self { nodes: vec![GrpcWeb::new(transport, fullnode_url.to_string())] }
+    }
+
+    pub fn with_transports(nodes: Vec<(T, String)>) -> Self {
+        Self { nodes: nodes.into_iter().map(|(t, u)| GrpcWeb::new(t, u)).collect() }
     }
 
     pub async fn verify_payment(&self, digest: &str, expected: &Expected<'_>) -> Result<Confirmed, VerifyError> {
         if !is_digest(digest) {
             return Err(VerifyError::NoMatchingPayment);
         }
-        let resp = match self.grpc.call(LEDGER_GET_TRANSACTION, build_get_transaction(digest)).await {
+        let mut answers = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            answers.push(Self::ask(node, digest, expected).await);
+        }
+        agree(answers)
+    }
+
+    async fn ask(node: &GrpcWeb<T>, digest: &str, expected: &Expected<'_>) -> Result<Confirmed, VerifyError> {
+        let resp = match node.call(LEDGER_GET_TRANSACTION, build_get_transaction(digest)).await {
             Ok(r) => r,
             Err(e) => {
                 return Err(match e.downcast_ref::<GrpcStatus>() {
@@ -154,6 +174,48 @@ impl<T: Transport> Sui<T> {
             }
         };
         check_response(&resp, expected)
+    }
+}
+
+/// Combines the nodes' answers: the same confirmation from all, or else the most cautious answer. An RPC failure, or a
+/// confirmation next to anything else, is `Rpc` (retry later); "not known yet" anywhere is `NotFound`; a rejection needs
+/// every node to give the same one.
+pub fn agree(answers: Vec<Result<Confirmed, VerifyError>>) -> Result<Confirmed, VerifyError> {
+    let mut answers = answers.into_iter();
+    let Some(first) = answers.next() else { return Err(VerifyError::Rpc(anyhow::anyhow!("no full node configured"))) };
+    let rest: Vec<_> = answers.collect();
+    if rest.is_empty() {
+        return first;
+    }
+    let all = std::iter::once(&first).chain(rest.iter());
+    if let Some(Err(VerifyError::Rpc(e))) = all.clone().find(|a| matches!(a, Err(VerifyError::Rpc(_)))) {
+        return Err(VerifyError::Rpc(anyhow::anyhow!("a full node could not be asked: {e}")));
+    }
+    let confirmed: Vec<&Confirmed> = all.clone().filter_map(|a| a.as_ref().ok()).collect();
+    if !confirmed.is_empty() {
+        if confirmed.len() == rest.len() + 1 && confirmed.iter().all(|c| *c == confirmed[0]) {
+            return first;
+        }
+        if all.clone().any(|a| matches!(a, Err(VerifyError::NotFound))) && confirmed.iter().all(|c| *c == confirmed[0])
+        {
+            return Err(VerifyError::NotFound);
+        }
+        return Err(VerifyError::Rpc(anyhow::anyhow!("the full nodes disagree about this transaction")));
+    }
+    if all.clone().any(|a| matches!(a, Err(VerifyError::NotFound))) {
+        return Err(VerifyError::NotFound);
+    }
+    let same = |a: &Result<Confirmed, VerifyError>, b: &Result<Confirmed, VerifyError>| {
+        matches!(
+            (a, b),
+            (Err(VerifyError::Failed), Err(VerifyError::Failed))
+                | (Err(VerifyError::NoMatchingPayment), Err(VerifyError::NoMatchingPayment))
+        )
+    };
+    if rest.iter().all(|r| same(&first, r)) {
+        first
+    } else {
+        Err(VerifyError::Rpc(anyhow::anyhow!("the full nodes disagree about this transaction")))
     }
 }
 
@@ -214,6 +276,30 @@ pub fn check_response(resp: &[u8], expected: &Expected<'_>) -> Result<Confirmed,
 mod tests {
     use super::*;
 
+    fn ok(payer: &str) -> Result<Confirmed, VerifyError> {
+        Ok(Confirmed { payer: payer.into(), amount: 5, units: 1, paid_until_ms: 9 })
+    }
+
+    #[test]
+    fn nodes_must_agree() {
+        use VerifyError::*;
+        let rpc = || Err(Rpc(anyhow::anyhow!("down")));
+        assert!(agree(vec![ok("a")]).is_ok(), "one node is trusted as configured");
+        assert!(agree(vec![ok("a"), ok("a")]).is_ok());
+        assert!(matches!(agree(vec![ok("a"), ok("b")]), Err(Rpc(_))), "different confirmations");
+        assert!(
+            matches!(agree(vec![ok("a"), Err(NoMatchingPayment)]), Err(Rpc(_))),
+            "a lie either way is a disagreement"
+        );
+        assert!(matches!(agree(vec![Err(Failed), ok("a")]), Err(Rpc(_))));
+        assert!(matches!(agree(vec![ok("a"), Err(NotFound)]), Err(NotFound)), "not on every node yet");
+        assert!(matches!(agree(vec![ok("a"), rpc()]), Err(Rpc(_))));
+        assert!(matches!(agree(vec![Err(NoMatchingPayment), Err(NoMatchingPayment)]), Err(NoMatchingPayment)));
+        assert!(matches!(agree(vec![Err(NoMatchingPayment), Err(Failed)]), Err(Rpc(_))));
+        assert!(matches!(agree(vec![Err(NoMatchingPayment), Err(NotFound)]), Err(NotFound)));
+        assert!(matches!(agree(vec![]), Err(Rpc(_))));
+    }
+
     // A real testnet payment (chain-payments-sui's throwaway TEST merchant), its GetTransaction response recorded raw.
     const PKG: &str = "0x5f67109c6b436fc0c0415d7f3e63ca10d374d8c4bb5e3b1f087cabb1c785bc14";
     const MERCHANT: &str = "0x30b6d544652d35d4a481fa7e45adf8e514b9ae1596377e837b6fdf36d967dae8";
@@ -272,7 +358,7 @@ mod tests {
         if std::env::var("LIVE_SUI").as_deref() != Ok("1") {
             return;
         }
-        let sui = Sui::new("https://fullnode.testnet.sui.io:443", Duration::from_secs(15)).unwrap();
+        let sui = Sui::new(&["https://fullnode.testnet.sui.io:443".to_string()], Duration::from_secs(15)).unwrap();
         let c = sui.verify_payment(DIGEST, &expected()).await.unwrap();
         assert_eq!(c.amount, 1000);
     }

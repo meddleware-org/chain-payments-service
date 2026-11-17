@@ -88,18 +88,20 @@ pub enum Submitted {
 pub enum Settled {
     /// This claim paid the session; the `session.paid` webhook is queued.
     Confirmed,
-    /// The transaction paid the quote, but the session was no longer open (paid by another transaction, or cancelled).
-    NotOpen,
+    /// The transaction paid the quote, but the session was no longer open (paid by another transaction, or cancelled):
+    /// recorded as `unapplied`, and the `payment.unapplied` webhook is queued for the merchant to credit or refund it.
+    Unapplied,
     /// Another process settled this claim first; its current status.
     Already(String),
 }
 
-/// The most informative status among a session's claims of one digest: confirmed, then pending, then rejected.
+/// The most informative status among a session's claims of one digest: confirmed, unapplied, pending, then rejected.
 fn best_status(statuses: impl IntoIterator<Item = String>) -> Option<String> {
     statuses.into_iter().min_by_key(|s| match s.as_str() {
         "confirmed" => 0,
-        "pending" => 1,
-        _ => 2,
+        "unapplied" => 1,
+        "pending" => 2,
+        _ => 3,
     })
 }
 
@@ -422,8 +424,8 @@ impl Store {
     }
 
     /// Confirms a payment, marks its session paid and queues the `session.paid` webhook, all in one transaction. A
-    /// session already paid by another transaction keeps its first payment (this one is recorded as confirmed too only
-    /// if the session was still open; otherwise it is rejected as a duplicate and the merchant is told nothing new).
+    /// session already paid (by another transaction) or cancelled keeps its state: this payment is recorded as
+    /// `unapplied` and the `payment.unapplied` webhook is queued instead, in the same transaction.
     pub async fn confirm_payment(
         &self,
         digest: &str,
@@ -459,10 +461,10 @@ impl Store {
         .await?
         .rows_affected()
             == 1;
-        let status = if paid { "confirmed" } else { "rejected" };
+        let status = if paid { "confirmed" } else { "unapplied" };
         sqlx::query(
             "UPDATE cp.payments SET status = $3, payer = $4, paid_until_ms = $5, confirmed_at = $6, \
-             last_error = CASE WHEN $3 = 'rejected' THEN 'paid on-chain, but the session was no longer open' ELSE NULL END \
+             last_error = CASE WHEN $3 = 'unapplied' THEN 'paid on-chain, but the session was no longer open' ELSE NULL END \
              WHERE digest = $1 AND nonce = $2",
         )
         .bind(digest)
@@ -473,10 +475,20 @@ impl Store {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        if paid {
-            let merchant_id: Uuid = row.try_get("merchant_id")?;
+        let merchant_id: Uuid = row.try_get("merchant_id")?;
+        let session_status: String = if paid {
+            "paid".into()
+        } else {
+            sqlx::query_scalar("SELECT status FROM cp.sessions WHERE id = $1")
+                .bind(&session_id)
+                .fetch_one(&mut *tx)
+                .await?
+        };
+        let event = if paid { "session.paid" } else { "payment.unapplied" };
+        {
             let payload = serde_json::json!({
-                "type": "session.paid",
+                "type": event,
+                "sessionStatus": session_status,
                 "sessionId": session_id,
                 "metadata": row.try_get::<Value, _>("metadata")?,
                 "amountPence": row.try_get::<i64, _>("amount_pence")?,
@@ -490,10 +502,10 @@ impl Store {
                 "payer": payer,
                 "paidUntilMs": paid_until_ms,
             });
-            enqueue(&mut tx, merchant_id, "session.paid", &payload).await?;
+            enqueue(&mut tx, merchant_id, event, &payload).await?;
         }
         tx.commit().await?;
-        Ok(if paid { Settled::Confirmed } else { Settled::NotOpen })
+        Ok(if paid { Settled::Confirmed } else { Settled::Unapplied })
     }
 
     /// Records a check that did not confirm: retry later (`retry_at`) or reject for good (`None`).
@@ -731,13 +743,22 @@ mod tests {
         );
         assert_eq!(
             s.confirm_payment("D2", &nonce, "0xother", 43, Utc::now()).await.unwrap(),
-            Settled::NotOpen,
+            Settled::Unapplied,
             "a second payment is not a second sale"
         );
-        assert_eq!(s.payment("D2", &nonce).await.unwrap().unwrap().status, "rejected");
+        assert_eq!(s.payment("D2", &nonce).await.unwrap().unwrap().status, "unapplied");
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "paid");
-        let hooks = s.claim_webhooks(Utc::now(), 10, 60).await.unwrap();
-        assert_eq!(hooks.len(), 1);
+        let mut hooks = s.claim_webhooks(Utc::now(), 10, 60).await.unwrap();
+        assert_eq!(hooks.len(), 2, "the sale, and the merchant is told about the second payment");
+        hooks.sort_by_key(|h| h.event.clone());
+        assert_eq!(hooks[0].event, "payment.unapplied");
+        assert_eq!(
+            (hooks[0].payload["payer"].as_str(), hooks[0].payload["digest"].as_str()),
+            (Some("0xother"), Some("D2"))
+        );
+        assert_eq!(hooks[0].payload["sessionStatus"], "paid");
+        s.webhook_delivered(hooks[0].id, Utc::now()).await.unwrap();
+        hooks.remove(0);
         assert_eq!(hooks[0].payload["paidUntilMs"], 42);
         assert_eq!(hooks[0].payload["metadata"]["a"], 1);
         assert!(s.claim_webhooks(Utc::now(), 10, 60).await.unwrap().is_empty(), "leased");
@@ -763,21 +784,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_payment_for_a_cancelled_session_is_recorded_not_sold() {
+    async fn a_payment_for_a_cancelled_session_is_unapplied_and_the_merchant_is_told() {
         let Some(s) = store().await else { return };
         let (m, session, nonce) = fixture(&s).await;
         assert!(s.cancel_session(m, &session).await.unwrap());
         s.submit_payment("D1", &session, &nonce).await.unwrap();
-        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::NotOpen);
+        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::Unapplied);
         let p = s.payment("D1", &nonce).await.unwrap().unwrap();
-        assert_eq!((p.status.as_str(), p.payer.as_deref()), ("rejected", Some("0xpayer")));
-        assert!(s.claim_webhooks(Utc::now(), 10, 60).await.unwrap().is_empty());
+        assert_eq!((p.status.as_str(), p.payer.as_deref()), ("unapplied", Some("0xpayer")));
+        assert_eq!(s.session(&session).await.unwrap().unwrap().status, "cancelled", "the session is not sold");
+        let hooks = s.claim_webhooks(Utc::now(), 10, 60).await.unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(
+            (hooks[0].event.as_str(), hooks[0].payload["sessionStatus"].as_str()),
+            ("payment.unapplied", Some("cancelled"))
+        );
+        assert_eq!(s.session_payment_status(&session, "D1").await.unwrap().as_deref(), Some("unapplied"));
     }
 
     #[test]
     fn best_status_prefers_confirmed_then_pending() {
         let v = |x: &[&str]| best_status(x.iter().map(|s| s.to_string()));
         assert_eq!(v(&["rejected", "confirmed", "pending"]).as_deref(), Some("confirmed"));
+        assert_eq!(v(&["pending", "unapplied", "rejected"]).as_deref(), Some("unapplied"));
         assert_eq!(v(&["rejected", "pending"]).as_deref(), Some("pending"));
         assert_eq!(v(&["rejected"]).as_deref(), Some("rejected"));
         assert_eq!(v(&[]), None);

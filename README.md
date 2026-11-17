@@ -21,7 +21,7 @@ Public (checkout; port 8080):
 | --- | --- | --- |
 | GET | `/v1/sessions/{id}` | amount, description, methods (no merchant metadata) |
 | POST | `/v1/sessions/{id}/quotes` | `{"method": "sui-testnet:SUI"}` → the signed quote with the exact amount |
-| POST | `/v1/sessions/{id}/payments` | `{"nonce", "digest"}` → `pending` / `confirmed` / `rejected` |
+| POST | `/v1/sessions/{id}/payments` | `{"nonce", "digest"}` → `pending` / `confirmed` / `rejected` / `unapplied` |
 | GET | `/v1/sessions/{id}/payments/{digest}` | status |
 | GET | `/v1/webhook-key` | the webhook public key |
 
@@ -29,8 +29,13 @@ Merchant (port 8081, `Authorization: Bearer <key>`): `POST /v1/merchant/sessions
 `POST /v1/merchant/sessions/{id}/cancel`; `GET /metrics`.
 
 Webhooks: `POST` to the merchant's URL with `chain-payments-signature: t=<unix>,ed25519=<base64 of "<t>.<body>">` and
-`chain-payments-event-id`; events `session.paid` (digest, payer, coin amount, price record, `paidUntilMs`) and
-`session.expired`.
+`chain-payments-event-id`; events `session.paid` (digest, payer, coin amount, price record, `paidUntilMs`),
+`session.expired`, and `payment.unapplied` (the same fields and `sessionStatus`): a transaction paid a quote of a session
+that was already paid or cancelled. The coins are the merchant's; the merchant credits the buyer or refunds them by hand.
+Nothing is refunded automatically, so paying stale quotes cannot make a merchant spend network fees.
+
+Full nodes: `SUI_GRPC_<NETWORK>` is one URL or a comma-separated list on different hosts. With several, a payment counts
+only when every node reports it the same way; mainnet requires two, from different operators.
 
 ## Running
 

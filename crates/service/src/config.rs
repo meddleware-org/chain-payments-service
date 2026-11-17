@@ -21,8 +21,9 @@ pub struct Config {
     pub registry: Registry,
     pub quote_signer: Signer,
     pub webhook_signer: Signer,
-    /// Full node gRPC base URL per network (`SUI_GRPC_TESTNET`, `SUI_GRPC_MAINNET`, …).
-    pub grpc: HashMap<String, String>,
+    /// Full node gRPC base URLs per network (`SUI_GRPC_TESTNET`, `SUI_GRPC_MAINNET`, …; comma-separated). Mainnet needs
+    /// two nodes on different hosts, run by different operators: a payment counts only when both report it the same way.
+    pub grpc: HashMap<String, Vec<String>>,
     pub sources: Vec<Source>,
     pub gecko_ids: HashMap<String, String>,
     pub min_sources: usize,
@@ -80,13 +81,35 @@ impl Config {
         let mut grpc = HashMap::new();
         for m in &registry.methods {
             let var = format!("SUI_GRPC_{}", m.network.to_ascii_uppercase());
-            let url =
+            let raw =
                 get(&var).ok_or_else(|| ConfigError::Invalid("SUI_GRPC_<NETWORK>", format!("{var} is not set")))?;
-            let ok = url.starts_with("https://") || (m.network == "localnet" && url.starts_with("http://127.0.0.1:"));
-            if !ok {
-                return Err(ConfigError::Invalid("SUI_GRPC_<NETWORK>", format!("{var} must be https")));
+            let urls: Vec<String> = raw.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
+            for url in &urls {
+                let ok =
+                    url.starts_with("https://") || (m.network == "localnet" && url.starts_with("http://127.0.0.1:"));
+                if !ok {
+                    return Err(ConfigError::Invalid("SUI_GRPC_<NETWORK>", format!("{var} must be https")));
+                }
             }
-            grpc.insert(m.network.clone(), url);
+            let host = |u: &str| {
+                u.split("://").nth(1).unwrap_or("").split(['/', ':']).next().unwrap_or("").to_ascii_lowercase()
+            };
+            let mut hosts: Vec<String> = urls.iter().map(|u| host(u)).collect();
+            hosts.sort();
+            hosts.dedup();
+            if urls.is_empty() || hosts.len() != urls.len() {
+                return Err(ConfigError::Invalid(
+                    "SUI_GRPC_<NETWORK>",
+                    format!("{var}: one or more full nodes, each on its own host"),
+                ));
+            }
+            if m.network == "mainnet" && urls.len() < 2 {
+                return Err(ConfigError::Invalid(
+                    "SUI_GRPC_<NETWORK>",
+                    format!("{var}: mainnet needs two full nodes from different operators (comma-separated)"),
+                ));
+            }
+            grpc.insert(m.network.clone(), urls);
         }
         let sources: Vec<Source> = get("PRICE_SOURCES")
             .unwrap_or_else(|| "kraken,coinbase,coingecko".into())
@@ -193,8 +216,28 @@ mod tests {
             [("SUI_GRPC_TESTNET", "http://fullnode.testnet.sui.io")],
             [("ALLOWED_ORIGINS", "https://a.example/path")],
             [("QUOTE_TTL_SECS", "3600")],
+            [("SUI_GRPC_TESTNET", "https://a.example,https://a.example:443")],
         ] {
             assert!(Config::from_env(env(&d, &extra)).is_err(), "{extra:?}");
         }
+    }
+
+    #[test]
+    fn mainnet_needs_two_full_nodes_on_different_hosts() {
+        let d = dir("mainnet");
+        std::fs::create_dir_all(&d).unwrap();
+        let methods = d.join("mainnet.json");
+        std::fs::write(
+            &methods,
+            r#"{"methods":[{"id":"sui-mainnet:SUI","chain":"sui","network":"mainnet","coinType":"0x2::sui::SUI","symbol":"SUI","decimals":9,"priceSymbol":"SUI","packageId":"0x5f67","merchantObject":"0x29d6"}]}"#,
+        )
+        .unwrap();
+        let m = methods.display().to_string();
+        let with =
+            |nodes: &str| Config::from_env(env(&d, &[("METHODS_FILE", m.as_str()), ("SUI_GRPC_MAINNET", nodes)]));
+        let err = with("https://fullnode.mainnet.sui.io:443").err().unwrap();
+        assert!(err.to_string().contains("two full nodes"), "{err}");
+        let c = with("https://fullnode.mainnet.sui.io:443, https://sui-mainnet.example.org").unwrap();
+        assert_eq!(c.grpc["mainnet"].len(), 2);
     }
 }

@@ -190,7 +190,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             VENDOR=${{ vars.VENDOR || 'Meddleware' }}
-            DESCRIPTION=${{ vars.DESCRIPTION || 'Content hub: canonical posts, roadmap and publishing queue (admin, public, worker).' }}
+            DESCRIPTION=${{ vars.DESCRIPTION || 'Chain Payments: checkout sessions, signed quotes, on-chain payment verification, signed webhooks.' }}
             SOURCE_URL=${{ vars.SOURCE_URL || 'https://github.com/meddleware-org/chain-payments-service' }}
             DOCUMENTATION_URL=${{ vars.DOCUMENTATION_URL || 'https://github.com/meddleware-org/chain-payments-service#readme' }}
             IMAGE_URL=${{ vars.IMAGE_URL || 'https://quay.io/meddleware-org/chain-payments-service' }}

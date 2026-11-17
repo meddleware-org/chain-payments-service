@@ -62,7 +62,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum MerchantAction {
-    /// Create a merchant; its API key is written to --key-out (mode 0600) and never printed.
+    /// Create a merchant. Its API key is either new, written to --key-out (mode 0600) and never printed, or read from
+    /// --key-file (a key generated elsewhere, e.g. a Secret both namespaces mount; then the command is idempotent: a
+    /// merchant that already has that key is left as it is).
     Add {
         #[arg(long)]
         name: String,
@@ -71,8 +73,10 @@ enum MerchantAction {
         /// Enabled payment method ids (comma-separated).
         #[arg(long, value_delimiter = ',')]
         methods: Vec<String>,
+        #[arg(long, conflicts_with = "key_file", required_unless_present = "key_file")]
+        key_out: Option<PathBuf>,
         #[arg(long)]
-        key_out: PathBuf,
+        key_file: Option<PathBuf>,
     },
     /// Give a merchant a new API key (written to --key-out).
     RotateKey {
@@ -141,16 +145,40 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("schema up to date");
             Ok(())
         }
-        Command::Merchant { action: MerchantAction::Add { name, webhook_url, methods, key_out } } => {
+        Command::Merchant { action: MerchantAction::Add { name, webhook_url, methods, key_out, key_file } } => {
             if let Some(u) = &webhook_url
                 && !worker::webhook_url_allowed(u)
             {
                 anyhow::bail!("the webhook URL must be https (or http to an in-cluster .svc host)");
             }
-            let key = format!("cpk_{}", random_id(24));
-            write_secret(&key_out, key.as_bytes())?;
-            let id = store(1)?.create_merchant(&name, &key, webhook_url.as_deref(), &methods).await?;
-            println!("merchant {id}; API key written to {}", key_out.display());
+            let store = store(1)?;
+            let key = match (&key_out, &key_file) {
+                (Some(out), None) => {
+                    let key = format!("cpk_{}", random_id(24));
+                    write_secret(out, key.as_bytes())?;
+                    key
+                }
+                (None, Some(file)) => {
+                    let key = std::fs::read_to_string(file)?.trim().to_string();
+                    if !(32..=128).contains(&key.len()) || !key.starts_with("cpk_") {
+                        anyhow::bail!(
+                            "{} does not hold a merchant API key (cpk_…, 32 to 128 characters)",
+                            file.display()
+                        );
+                    }
+                    if let Some(m) = store.merchant_by_key(&key).await? {
+                        println!("merchant {} already has this key; nothing changed", m.id);
+                        return Ok(());
+                    }
+                    key
+                }
+                _ => anyhow::bail!("give --key-out or --key-file"),
+            };
+            let id = store.create_merchant(&name, &key, webhook_url.as_deref(), &methods).await?;
+            match key_out {
+                Some(out) => println!("merchant {id}; API key written to {}", out.display()),
+                None => println!("merchant {id} created with the key from the key file"),
+            }
             Ok(())
         }
         Command::Merchant { action: MerchantAction::RotateKey { id, key_out } } => {

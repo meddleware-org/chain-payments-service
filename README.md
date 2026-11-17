@@ -39,6 +39,8 @@ chain-payments keygen --out quote.key       # prints the public key for the on-c
 chain-payments keygen --out webhook.key
 chain-payments migrate
 chain-payments merchant add --name "Shop" --methods sui-testnet:SUI --webhook-url https://shop.example/hooks --key-out shop.key
+# or, with a key generated elsewhere (a Secret both sides mount; re-running changes nothing):
+chain-payments merchant add --name "Shop" --methods sui-testnet:SUI --key-file /run/secrets/shop.key
 METHODS_FILE=methods.json QUOTE_KEY_FILE=quote.key WEBHOOK_KEY_FILE=webhook.key SUI_GRPC_TESTNET=https://fullnode.testnet.sui.io:443 \
   ALLOWED_ORIGINS=https://shop.example DATABASE_URL='postgres://…?sslmode=verify-full&sslrootcert=ca.crt' chain-payments serve
 chain-payments worker   # same environment; serves /metrics and /healthz on WORKER_LISTEN_ADDR (0.0.0.0:8081)

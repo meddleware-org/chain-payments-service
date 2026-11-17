@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased (first pass of the security audit, 2026-11-17; ships in the first tag, 0.0.1)
+## 0.0.1 — 2026-11-17 (first image)
+
+After the first pass of the security audit:
 
 - The testnet package is `0x610cf31f…6af2` (fresh, immutable, with the platform fee). `Paid.platform_fee` is read into
   `Confirmed.platform_fee` and sent to the merchant as `platformFee` in `session.paid` and `payment.unapplied`.
@@ -22,7 +24,7 @@
 - `scripts/e2e-testnet.sh` checks the chain identifier, not only the env's name, before it signs.
 - A payment that arrives for a cancelled session is recorded as "paid on-chain, but the session was no longer open".
 
-## 0.0.1 — 2026-11-16
+First built 2026-11-16:
 
 - First release: checkout sessions, exact quotes from the median of Kraken, Coinbase and CoinGecko (GBP), the quote message
   shared with the `chain_payments` Move package, payment verification by digest on Sui (gRPC-web), the webhook outbox with

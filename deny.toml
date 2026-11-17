@@ -4,6 +4,12 @@
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [advisories]
+ignore = [
+    # Reviewed 2026-11-17. RUSTSEC-2026-0543 says chrono is unmaintained; it reports no vulnerability. chrono comes in
+    # through sqlx as well as this code, so leaving it means moving the service and sqlx's column types to another date
+    # library together (FU-0134). Drop this entry when that is done.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; also required by sqlx; migration tracked (FU-0134)" },
+]
 # RustSec advisories: vulnerable and yanked crates fail the build; unmaintained crates are reported
 # for the whole graph so a replacement can be planned.
 yanked = "deny"

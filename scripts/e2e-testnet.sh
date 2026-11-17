@@ -11,6 +11,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${TEST_DATABASE_URL:?start scripts/test-postgres.sh first}"
 [[ "$(sui client active-env)" == testnet ]] || { echo "the active sui env must be testnet" >&2; exit 2; }
+# The env's name is the operator's; the chain identifier is the chain's (a mismatch is a hard stop, never a warning).
+chain="$(sui client chain-identifier 2> /dev/null | sed -n 's/^Hex: *//p' || true)"
+[[ "$chain" == 4c78adac ]] || { echo "the active sui env is not testnet (chain identifier ${chain:-unknown})" >&2; exit 2; }
 PKG=0x5f67109c6b436fc0c0415d7f3e63ca10d374d8c4bb5e3b1f087cabb1c785bc14
 MERCHANT=0x30b6d544652d35d4a481fa7e45adf8e514b9ae1596377e837b6fdf36d967dae8
 

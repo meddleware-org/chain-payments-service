@@ -87,7 +87,7 @@ pub async fn tick(app: &Shared, client: &reqwest::Client) {
     match app.store.due_payments(now, 50).await {
         Ok(due) => {
             for p in due {
-                if let Err(e) = app.settle(&p.digest).await {
+                if let Err(e) = app.settle(&p.digest, &p.nonce).await {
                     tracing::warn!(digest = %p.digest, error = %e, "settle");
                 }
             }

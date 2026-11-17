@@ -10,14 +10,24 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use std::time::Duration;
+
 use chain_payments_core::money::format_gbp;
 use chain_payments_core::session::{DEFAULT_SESSION_SECS, NewSession, random_id};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::app::{App, OpError, Shared};
 use crate::metrics::Metrics;
+
+/// Requests one API process works on at once. Bodies are capped at 4 KiB (public) and 16 KiB (merchant), so the memory
+/// they can hold is well under a megabyte; the real bound is the database pool and the full node, which queue behind it.
+pub const MAX_CONCURRENT_REQUESTS: usize = 64;
+/// Longest a request may take: a quote waits for the price sources (6 s) and a payment for the full node (10 s).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
@@ -102,7 +112,7 @@ async fn post_payment(
     app.store.submit_payment(&r.digest, &id, &r.nonce).await?;
     Metrics::inc(&app.metrics.payments_submitted);
     // One immediate check (the transaction is usually final already); the watcher retries a pending one.
-    let status = app.settle(&r.digest).await?;
+    let status = app.settle(&r.digest, &r.nonce).await?;
     Ok(Json(json!({ "digest": r.digest, "status": status })).into_response())
 }
 
@@ -110,11 +120,11 @@ async fn get_payment(
     State(app): State<Shared>,
     Path((id, digest)): Path<(String, String)>,
 ) -> Result<Response, OpError> {
-    let p = app.store.payment(&digest).await?.ok_or(OpError::NotFound)?;
-    if p.session_id != id {
+    if !valid_session_id(&id) || !chain_payments_chain_sui::is_digest(&digest) {
         return Err(OpError::NotFound);
     }
-    Ok(Json(json!({ "digest": p.digest, "status": p.status })).into_response())
+    let status = app.store.session_payment_status(&id, &digest).await?.ok_or(OpError::NotFound)?;
+    Ok(Json(json!({ "digest": digest, "status": status })).into_response())
 }
 
 async fn webhook_key(State(app): State<Shared>) -> Response {
@@ -169,6 +179,8 @@ pub fn public_router(app: Shared) -> Router {
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
         .layer(middleware::from_fn_with_state(app.clone(), public_guard))
         .layer(DefaultBodyLimit::max(4 * 1024))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
         .with_state(app)
 }
 
@@ -281,6 +293,8 @@ pub fn merchant_router(app: Shared) -> Router {
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
         .with_state(app)
 }
 

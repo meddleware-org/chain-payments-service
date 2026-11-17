@@ -103,7 +103,8 @@ impl Config {
             .split(',')
             .filter_map(|p| p.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
             .collect();
-        let min_sources = bounded(&get, "PRICE_MIN_SOURCES", 2usize, 1, 3)?;
+        // At least two sources always (ADR-0011 §3): one source alone has nothing to agree with.
+        let min_sources = bounded(&get, "PRICE_MIN_SOURCES", 2usize, 2, 3)?;
         if min_sources > sources.len() {
             return Err(ConfigError::Invalid("PRICE_MIN_SOURCES", "more than the configured sources".into()));
         }
@@ -134,5 +135,66 @@ impl Config {
             allowed_origins,
             max_quotes_per_session: bounded(&get, "MAX_QUOTES_PER_SESSION", 30i64, 1, 500)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(dir: &std::path::Path, extra: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("q.key"), [1u8; 32]).unwrap();
+        std::fs::write(dir.join("w.key"), [2u8; 32]).unwrap();
+        std::fs::write(
+            dir.join("methods.json"),
+            r#"{"methods":[{"id":"sui-testnet:SUI","chain":"sui","network":"testnet","coinType":"0x2::sui::SUI","symbol":"SUI","decimals":9,"priceSymbol":"SUI","packageId":"0x5f67","merchantObject":"0x29d6"}]}"#,
+        )
+        .unwrap();
+        let mut m: HashMap<String, String> = [
+            ("METHODS_FILE", dir.join("methods.json").display().to_string()),
+            ("QUOTE_KEY_FILE", dir.join("q.key").display().to_string()),
+            ("WEBHOOK_KEY_FILE", dir.join("w.key").display().to_string()),
+            ("SUI_GRPC_TESTNET", "https://fullnode.testnet.sui.io:443".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        for (k, v) in extra {
+            m.insert((*k).to_string(), (*v).to_string());
+        }
+        move |k: &str| m.get(k).cloned()
+    }
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cp-config-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn defaults_are_accepted() {
+        let c = Config::from_env(env(&dir("ok"), &[])).unwrap();
+        assert_eq!((c.min_sources, c.max_spread_bps, c.quote_ttl.as_secs()), (2, 200, 120));
+    }
+
+    #[test]
+    fn a_single_price_source_is_never_enough() {
+        let e = Config::from_env(env(&dir("one"), &[("PRICE_MIN_SOURCES", "1")])).err().unwrap();
+        assert!(e.to_string().contains("PRICE_MIN_SOURCES"), "{e}");
+        let e = Config::from_env(env(&dir("few"), &[("PRICE_SOURCES", "kraken")])).err().unwrap();
+        assert!(e.to_string().contains("PRICE_MIN_SOURCES"), "{e}");
+    }
+
+    #[test]
+    fn doubtful_values_are_refused() {
+        let d = dir("bad");
+        let same = d.join("q.key").display().to_string();
+        for extra in [
+            [("WEBHOOK_KEY_FILE", same.as_str())],
+            [("SUI_GRPC_TESTNET", "http://fullnode.testnet.sui.io")],
+            [("ALLOWED_ORIGINS", "https://a.example/path")],
+            [("QUOTE_TTL_SECS", "3600")],
+        ] {
+            assert!(Config::from_env(env(&d, &extra)).is_err(), "{extra:?}");
+        }
     }
 }

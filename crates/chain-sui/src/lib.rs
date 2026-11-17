@@ -3,8 +3,9 @@
 //! the platform); this crate adds an HTTP transport and the `Paid` event check.
 //!
 //! A payment is confirmed only when the transaction's effects report success AND it emitted exactly the package's
-//! `chain_payments::Paid` event for the expected merchant object, session, nonce, coin type and amount. Everything is
-//! compared after normalisation; anything missing fails closed.
+//! `chain_payments::Paid` event for the expected merchant object, session, nonce, coin type, amount, units and
+//! subscription reference (every quote field the event carries). Everything is compared after normalisation; anything
+//! missing fails closed.
 
 use std::time::Duration;
 
@@ -83,6 +84,10 @@ pub struct Expected<'a> {
     /// Canonical coin type (`000…002::sui::SUI`).
     pub coin_type: &'a str,
     pub amount: u64,
+    /// The session's units and subscription reference. The nonce already names one signed quote; checking these too means
+    /// a quote signed by any other key the merchant's cap may have set cannot buy more than this session sold.
+    pub units: u64,
+    pub subscription_ref: &'a str,
 }
 
 /// A confirmed payment.
@@ -181,7 +186,13 @@ pub fn check_response(resp: &[u8], expected: &Expected<'_>) -> Result<Confirmed,
             && value_find_string(json, "session").and_then(|s| b64(&s)).as_deref() == Some(expected.session.as_bytes())
             && value_find_string(json, "nonce").and_then(|s| b64(&s)).as_deref() == Some(expected.nonce.as_bytes())
             && value_find_string(json, "coin_type").as_deref() == Some(expected.coin_type)
-            && u64_field(json, "amount") == Some(expected.amount);
+            && u64_field(json, "amount") == Some(expected.amount)
+            && u64_field(json, "units") == Some(expected.units)
+            && match value_find_string(json, "subscription_ref") {
+                Some(r) => b64(&r).as_deref() == Some(expected.subscription_ref.as_bytes()),
+                // The package's event always has the field; an empty vector may be rendered as an absent value.
+                None => expected.subscription_ref.is_empty(),
+            };
         if !matches {
             continue;
         }
@@ -192,7 +203,7 @@ pub fn check_response(resp: &[u8], expected: &Expected<'_>) -> Result<Confirmed,
         return Ok(Confirmed {
             payer,
             amount: expected.amount,
-            units: u64_field(json, "units").unwrap_or(0),
+            units: expected.units,
             paid_until_ms: u64_field(json, "paid_until_ms").unwrap_or(0),
         });
     }
@@ -217,6 +228,8 @@ mod tests {
             nonce: "nonce-live-1",
             coin_type: SUI,
             amount: 1000,
+            units: 1,
+            subscription_ref: "acct-live",
         }
     }
 
@@ -233,6 +246,9 @@ mod tests {
             Expected { nonce: "other", ..expected() },
             Expected { merchant_object: "0x1", ..expected() },
             Expected { package_id: "0x2", ..expected() },
+            Expected { units: 2, ..expected() },
+            Expected { subscription_ref: "acct-other", ..expected() },
+            Expected { subscription_ref: "", ..expected() },
             Expected {
                 coin_type: "0000000000000000000000000000000000000000000000000000000000000002::usdc::USDC",
                 ..expected()

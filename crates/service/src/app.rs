@@ -9,7 +9,7 @@ use chain_payments_core::money::{format_gbp, format_units, pence_to_units};
 use chain_payments_core::quote::QuoteFields;
 use chain_payments_core::registry::Method;
 use chain_payments_core::session::random_id;
-use chain_payments_store::{Quote, Store};
+use chain_payments_store::{Quote, Settled, Store};
 use chrono::Utc;
 use serde_json::{Value, json};
 
@@ -17,8 +17,15 @@ use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::prices::Prices;
 
-/// A pending payment that is still unknown after this long is rejected.
+/// A claim whose transaction no full node knows after this long is rejected.
 pub const GIVE_UP_AFTER_SECS: i64 = 3600;
+
+/// Whether a retryable verification error ends a claim. Only "the node does not know this transaction" does, and only
+/// after [`GIVE_UP_AFTER_SECS`]: an outage of our own full node (an RPC error) is never a reason to reject a real
+/// payment, so it is retried (with capped backoff) until the node answers.
+pub fn gives_up(e: &VerifyError, age_secs: i64) -> bool {
+    matches!(e, VerifyError::NotFound) && age_secs > GIVE_UP_AFTER_SECS
+}
 
 pub struct App {
     pub store: Store,
@@ -151,13 +158,15 @@ impl App {
         }))
     }
 
-    /// Checks a submitted payment on-chain once and records the outcome. Returns its status afterwards.
-    pub async fn settle(&self, digest: &str) -> Result<String, OpError> {
-        let p = self.store.payment(digest).await?.ok_or(OpError::NotFound)?;
+    /// Checks a submitted claim (a transaction digest paying one quote) on-chain once and records the outcome. Returns
+    /// the claim's status afterwards.
+    pub async fn settle(&self, digest: &str, nonce: &str) -> Result<String, OpError> {
+        let p = self.store.payment(digest, nonce).await?.ok_or(OpError::NotFound)?;
         if p.status != "pending" {
             return Ok(p.status);
         }
         let q = self.store.quote(&p.nonce).await?.ok_or(OpError::NotFound)?;
+        let s = self.store.session(&q.session_id).await?.ok_or(OpError::NotFound)?;
         let m = self.method(&q.method_id).ok_or_else(|| OpError::Refused("unknown payment method".into()))?;
         let Some(chain) = self.chains.get(&m.network) else {
             return Err(OpError::Refused("no full node for this network".into()));
@@ -169,29 +178,40 @@ impl App {
             nonce: &q.nonce,
             coin_type: &q.coin_type,
             amount: q.amount as u64,
+            units: s.units as u64,
+            subscription_ref: &s.subscription_ref,
         };
         let now = Utc::now();
         match chain.verify_payment(digest, &expected).await {
-            Ok(c) => {
-                if self.store.confirm_payment(digest, &c.payer, c.paid_until_ms as i64, now).await? {
+            Ok(c) => match self.store.confirm_payment(digest, nonce, &c.payer, c.paid_until_ms as i64, now).await? {
+                Settled::Confirmed => {
                     Metrics::inc(&self.metrics.payments_confirmed);
                     tracing::info!(session = %q.session_id, %digest, "payment confirmed");
                     Ok("confirmed".into())
-                } else {
+                }
+                Settled::NotOpen => {
                     Metrics::inc(&self.metrics.payments_rejected);
+                    tracing::warn!(session = %q.session_id, %digest, "paid on-chain for a session that was no longer open");
                     Ok("rejected".into())
                 }
-            }
+                // The other process's outcome stands (and was counted there).
+                Settled::Already(status) => Ok(status),
+            },
             Err(e) if e.retryable() => {
-                let age = self.store.payment_age_secs(digest, now).await?;
-                if age > GIVE_UP_AFTER_SECS {
-                    self.store.payment_not_confirmed(digest, &e.to_string(), None).await?;
+                let age = self.store.payment_age_secs(digest, nonce, now).await?;
+                if gives_up(&e, age) {
+                    self.store.payment_not_confirmed(digest, nonce, &e.to_string(), None).await?;
                     Metrics::inc(&self.metrics.payments_rejected);
                     return Ok("rejected".into());
                 }
                 let backoff = 2i64.saturating_pow((p.attempts.clamp(0, 8)) as u32).min(300);
                 self.store
-                    .payment_not_confirmed(digest, &e.to_string(), Some(now + chrono::Duration::seconds(backoff)))
+                    .payment_not_confirmed(
+                        digest,
+                        nonce,
+                        &e.to_string(),
+                        Some(now + chrono::Duration::seconds(backoff)),
+                    )
                     .await?;
                 Ok("pending".into())
             }
@@ -200,10 +220,22 @@ impl App {
                     VerifyError::Failed => "the transaction failed",
                     _ => "the transaction did not pay this quote",
                 };
-                self.store.payment_not_confirmed(digest, reason, None).await?;
+                self.store.payment_not_confirmed(digest, nonce, reason, None).await?;
                 Metrics::inc(&self.metrics.payments_rejected);
                 Ok("rejected".into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unknown_transaction_is_given_up_on() {
+        assert!(!gives_up(&VerifyError::NotFound, GIVE_UP_AFTER_SECS));
+        assert!(gives_up(&VerifyError::NotFound, GIVE_UP_AFTER_SECS + 1));
+        assert!(!gives_up(&VerifyError::Rpc(anyhow::anyhow!("node down")), 10 * GIVE_UP_AFTER_SECS));
     }
 }

@@ -83,6 +83,26 @@ pub enum Submitted {
     AlreadyKnown,
 }
 
+/// What confirming a verified payment did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settled {
+    /// This claim paid the session; the `session.paid` webhook is queued.
+    Confirmed,
+    /// The transaction paid the quote, but the session was no longer open (paid by another transaction, or cancelled).
+    NotOpen,
+    /// Another process settled this claim first; its current status.
+    Already(String),
+}
+
+/// The most informative status among a session's claims of one digest: confirmed, then pending, then rejected.
+fn best_status(statuses: impl IntoIterator<Item = String>) -> Option<String> {
+    statuses.into_iter().min_by_key(|s| match s.as_str() {
+        "confirmed" => 0,
+        "pending" => 1,
+        _ => 2,
+    })
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -315,12 +335,14 @@ impl Store {
         rows.iter().map(payment_from).collect()
     }
 
-    /// When a payment was first submitted (the watcher gives up after a while).
-    pub async fn payment_age_secs(&self, digest: &str, now: DateTime<Utc>) -> Result<i64, DbError> {
-        let created: DateTime<Utc> = sqlx::query_scalar("SELECT created_at FROM cp.payments WHERE digest = $1")
-            .bind(digest)
-            .fetch_one(&self.pool)
-            .await?;
+    /// When a claim was first submitted (the watcher gives up on a transaction nobody can find after a while).
+    pub async fn payment_age_secs(&self, digest: &str, nonce: &str, now: DateTime<Utc>) -> Result<i64, DbError> {
+        let created: DateTime<Utc> =
+            sqlx::query_scalar("SELECT created_at FROM cp.payments WHERE digest = $1 AND nonce = $2")
+                .bind(digest)
+                .bind(nonce)
+                .fetch_one(&self.pool)
+                .await?;
         Ok((now - created).num_seconds())
     }
 
@@ -349,10 +371,11 @@ impl Store {
 
     // ── payments ───────────────────────────────────────────────────────────
 
-    /// Records a submitted transaction for a quote (idempotent by digest).
+    /// Records a claim that a transaction paid a quote (idempotent per digest and quote). Claims of one digest against
+    /// different quotes are independent, so a wrong claim cannot stand in the way of the right one.
     pub async fn submit_payment(&self, digest: &str, session_id: &str, nonce: &str) -> Result<Submitted, DbError> {
         let r = sqlx::query(
-            "INSERT INTO cp.payments (digest, session_id, nonce) VALUES ($1, $2, $3) ON CONFLICT (digest) DO NOTHING",
+            "INSERT INTO cp.payments (digest, session_id, nonce) VALUES ($1, $2, $3) ON CONFLICT (digest, nonce) DO NOTHING",
         )
         .bind(digest)
         .bind(session_id)
@@ -362,14 +385,27 @@ impl Store {
         Ok(if r.rows_affected() == 1 { Submitted::New } else { Submitted::AlreadyKnown })
     }
 
-    pub async fn payment(&self, digest: &str) -> Result<Option<Payment>, DbError> {
+    pub async fn payment(&self, digest: &str, nonce: &str) -> Result<Option<Payment>, DbError> {
         let r = sqlx::query(
-            "SELECT digest, session_id, nonce, status, payer, paid_until_ms, attempts FROM cp.payments WHERE digest = $1",
+            "SELECT digest, session_id, nonce, status, payer, paid_until_ms, attempts FROM cp.payments \
+             WHERE digest = $1 AND nonce = $2",
         )
         .bind(digest)
+        .bind(nonce)
         .fetch_optional(&self.pool)
         .await?;
         r.map(|r| payment_from(&r)).transpose()
+    }
+
+    /// The status of a digest for a session: the best of its claims (what a checkout following its payment sees).
+    pub async fn session_payment_status(&self, session_id: &str, digest: &str) -> Result<Option<String>, DbError> {
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM cp.payments WHERE session_id = $1 AND digest = $2")
+                .bind(session_id)
+                .bind(digest)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(best_status(statuses))
     }
 
     /// Pending payments due for a check (the watcher), oldest first.
@@ -391,22 +427,27 @@ impl Store {
     pub async fn confirm_payment(
         &self,
         digest: &str,
+        nonce: &str,
         payer: &str,
         paid_until_ms: i64,
         now: DateTime<Utc>,
-    ) -> Result<bool, DbError> {
+    ) -> Result<Settled, DbError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT p.session_id, s.merchant_id, s.metadata, s.amount_pence, s.units, s.subscription_ref, q.method_id, \
              q.coin_type, q.amount, q.price FROM cp.payments p JOIN cp.sessions s ON s.id = p.session_id \
-             JOIN cp.quotes q ON q.nonce = p.nonce WHERE p.digest = $1 AND p.status = 'pending' FOR UPDATE OF p, s",
+             JOIN cp.quotes q ON q.nonce = p.nonce WHERE p.digest = $1 AND p.nonce = $2 AND p.status = 'pending' \
+             FOR UPDATE OF p, s",
         )
         .bind(digest)
+        .bind(nonce)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
             tx.rollback().await?;
-            return Ok(false);
+            // Settled by another process (the API's immediate check and the watcher race on every submission).
+            let status = self.payment(digest, nonce).await?.map(|p| p.status).unwrap_or_else(|| "rejected".into());
+            return Ok(Settled::Already(status));
         };
         let session_id: String = row.try_get("session_id")?;
         let paid = sqlx::query(
@@ -420,10 +461,12 @@ impl Store {
             == 1;
         let status = if paid { "confirmed" } else { "rejected" };
         sqlx::query(
-            "UPDATE cp.payments SET status = $2, payer = $3, paid_until_ms = $4, confirmed_at = $5, \
-             last_error = CASE WHEN $2 = 'rejected' THEN 'the session was already paid' ELSE NULL END WHERE digest = $1",
+            "UPDATE cp.payments SET status = $3, payer = $4, paid_until_ms = $5, confirmed_at = $6, \
+             last_error = CASE WHEN $3 = 'rejected' THEN 'paid on-chain, but the session was no longer open' ELSE NULL END \
+             WHERE digest = $1 AND nonce = $2",
         )
         .bind(digest)
+        .bind(nonce)
         .bind(status)
         .bind(payer)
         .bind(paid_until_ms)
@@ -450,13 +493,14 @@ impl Store {
             enqueue(&mut tx, merchant_id, "session.paid", &payload).await?;
         }
         tx.commit().await?;
-        Ok(paid)
+        Ok(if paid { Settled::Confirmed } else { Settled::NotOpen })
     }
 
     /// Records a check that did not confirm: retry later (`retry_at`) or reject for good (`None`).
     pub async fn payment_not_confirmed(
         &self,
         digest: &str,
+        nonce: &str,
         error: &str,
         retry_at: Option<DateTime<Utc>>,
     ) -> Result<(), DbError> {
@@ -465,10 +509,11 @@ impl Store {
             None => ("rejected", Utc::now()),
         };
         sqlx::query(
-            "UPDATE cp.payments SET status = $2, attempts = attempts + 1, last_error = $3, next_check_at = $4 \
-             WHERE digest = $1 AND status = 'pending'",
+            "UPDATE cp.payments SET status = $3, attempts = attempts + 1, last_error = $4, next_check_at = $5 \
+             WHERE digest = $1 AND nonce = $2 AND status = 'pending'",
         )
         .bind(digest)
+        .bind(nonce)
         .bind(status)
         .bind(error)
         .bind(next)
@@ -653,6 +698,24 @@ mod tests {
         assert!(s.merchant_by_key("key-2").await.unwrap().is_none());
     }
 
+    /// A second quote of the fixture's session (what anyone who knows the session id can ask for).
+    async fn second_quote(s: &Store, session: &str) -> String {
+        let nonce = "00112233445566778899aabbccddeeff".to_string();
+        s.insert_quote(&Quote {
+            nonce: nonce.clone(),
+            session_id: session.to_string(),
+            method_id: "sui-testnet:SUI".into(),
+            coin_type: "0000000000000000000000000000000000000000000000000000000000000002::sui::SUI".into(),
+            amount: 5_542_213_191,
+            expires_ms: 1,
+            signature: "00".into(),
+            price: serde_json::json!({"pricePico": "541300000000"}),
+        })
+        .await
+        .unwrap();
+        nonce
+    }
+
     #[tokio::test]
     async fn a_confirmed_payment_pays_the_session_once_and_queues_one_webhook() {
         let Some(s) = store().await else { return };
@@ -660,13 +723,18 @@ mod tests {
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::New);
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::AlreadyKnown);
         assert_eq!(s.submit_payment("D2", &session, &nonce).await.unwrap(), Submitted::New);
-        assert!(s.confirm_payment("D1", "0xpayer", 42, Utc::now()).await.unwrap());
-        assert!(!s.confirm_payment("D1", "0xpayer", 42, Utc::now()).await.unwrap(), "confirmed once");
-        assert!(
-            !s.confirm_payment("D2", "0xother", 43, Utc::now()).await.unwrap(),
+        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::Confirmed);
+        assert_eq!(
+            s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(),
+            Settled::Already("confirmed".into()),
+            "a second settlement of the same claim reports the first one's outcome, not a rejection"
+        );
+        assert_eq!(
+            s.confirm_payment("D2", &nonce, "0xother", 43, Utc::now()).await.unwrap(),
+            Settled::NotOpen,
             "a second payment is not a second sale"
         );
-        assert_eq!(s.payment("D2").await.unwrap().unwrap().status, "rejected");
+        assert_eq!(s.payment("D2", &nonce).await.unwrap().unwrap().status, "rejected");
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "paid");
         let hooks = s.claim_webhooks(Utc::now(), 10, 60).await.unwrap();
         assert_eq!(hooks.len(), 1);
@@ -678,13 +746,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wrong_claim_of_a_digest_cannot_block_the_right_one() {
+        let Some(s) = store().await else { return };
+        let (_, session, nonce) = fixture(&s).await;
+        let other = second_quote(&s, &session).await;
+        // Someone who read the Paid event submits its digest against another quote first; the chain check rejects it.
+        assert_eq!(s.submit_payment("D1", &session, &other).await.unwrap(), Submitted::New);
+        s.payment_not_confirmed("D1", &other, "the transaction did not pay this quote", None).await.unwrap();
+        assert_eq!(s.session_payment_status(&session, "D1").await.unwrap().as_deref(), Some("rejected"));
+        // The payer's own claim is a new record and is confirmed.
+        assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::New);
+        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::Confirmed);
+        assert_eq!(s.session_payment_status(&session, "D1").await.unwrap().as_deref(), Some("confirmed"));
+        assert_eq!(s.session(&session).await.unwrap().unwrap().status, "paid");
+        assert!(s.session_payment_status(&session, "D9").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_payment_for_a_cancelled_session_is_recorded_not_sold() {
+        let Some(s) = store().await else { return };
+        let (m, session, nonce) = fixture(&s).await;
+        assert!(s.cancel_session(m, &session).await.unwrap());
+        s.submit_payment("D1", &session, &nonce).await.unwrap();
+        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::NotOpen);
+        let p = s.payment("D1", &nonce).await.unwrap().unwrap();
+        assert_eq!((p.status.as_str(), p.payer.as_deref()), ("rejected", Some("0xpayer")));
+        assert!(s.claim_webhooks(Utc::now(), 10, 60).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn best_status_prefers_confirmed_then_pending() {
+        let v = |x: &[&str]| best_status(x.iter().map(|s| s.to_string()));
+        assert_eq!(v(&["rejected", "confirmed", "pending"]).as_deref(), Some("confirmed"));
+        assert_eq!(v(&["rejected", "pending"]).as_deref(), Some("pending"));
+        assert_eq!(v(&["rejected"]).as_deref(), Some("rejected"));
+        assert_eq!(v(&[]), None);
+    }
+
+    #[tokio::test]
     async fn expiry_waits_for_pending_payments_and_queues_a_webhook() {
         let Some(s) = store().await else { return };
         let (_, session, nonce) = fixture(&s).await;
         s.submit_payment("D1", &session, &nonce).await.unwrap();
         let later = Utc::now() + chrono::Duration::hours(1);
         assert_eq!(s.expire_sessions(later).await.unwrap(), 0, "a pending payment holds the session open");
-        s.payment_not_confirmed("D1", "the transaction failed", None).await.unwrap();
+        s.payment_not_confirmed("D1", &nonce, "the transaction failed", None).await.unwrap();
         assert_eq!(s.expire_sessions(later).await.unwrap(), 1);
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "expired");
         let hooks = s.claim_webhooks(later, 10, 60).await.unwrap();
@@ -697,7 +803,9 @@ mod tests {
         let (_, session, nonce) = fixture(&s).await;
         s.submit_payment("D1", &session, &nonce).await.unwrap();
         assert_eq!(s.due_payments(Utc::now() + chrono::Duration::seconds(1), 10).await.unwrap().len(), 1);
-        s.payment_not_confirmed("D1", "not found yet", Some(Utc::now() + chrono::Duration::minutes(1))).await.unwrap();
+        s.payment_not_confirmed("D1", &nonce, "not found yet", Some(Utc::now() + chrono::Duration::minutes(1)))
+            .await
+            .unwrap();
         assert!(s.due_payments(Utc::now(), 10).await.unwrap().is_empty());
         let first = s.try_watcher_lock().await.unwrap();
         assert!(first.is_some());

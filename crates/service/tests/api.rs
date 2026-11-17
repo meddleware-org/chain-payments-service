@@ -127,6 +127,15 @@ async fn a_checkout_reads_its_session_and_gets_exact_quotes() {
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
+    let digest = "7AkSLeZfxX2qURL2oHYmKkf3AKNaunJBJLski7TzGUYR";
+    let (st, _, _) =
+        call(p.clone(), Request::get(format!("/v1/sessions/{id}/payments/{digest}")).body(Body::empty()).unwrap())
+            .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "no claim of this digest for this session");
+    let (st, _, _) =
+        call(p.clone(), Request::get(format!("/v1/sessions/{id}/payments/not-a-digest")).body(Body::empty()).unwrap())
+            .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
     let (st, _, _) =
         call(p, Request::get("/v1/sessions/ffffffffffffffffffffffffffffffff").body(Body::empty()).unwrap()).await;
     assert_eq!(st, StatusCode::NOT_FOUND);

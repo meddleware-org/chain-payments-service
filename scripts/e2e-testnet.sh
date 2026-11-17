@@ -14,8 +14,10 @@ cd "$(dirname "$0")/.."
 # The env's name is the operator's; the chain identifier is the chain's (a mismatch is a hard stop, never a warning).
 chain="$(sui client chain-identifier 2> /dev/null | sed -n 's/^Hex: *//p' || true)"
 [[ "$chain" == 4c78adac ]] || { echo "the active sui env is not testnet (chain identifier ${chain:-unknown})" >&2; exit 2; }
-PKG=0x5f67109c6b436fc0c0415d7f3e63ca10d374d8c4bb5e3b1f087cabb1c785bc14
-MERCHANT=0x30b6d544652d35d4a481fa7e45adf8e514b9ae1596377e837b6fdf36d967dae8
+PKG=0x610cf31fa9455893f1d0d139e6aa6ca4559a9f2acf07391c0d47c4e86a9c6af2
+MERCHANT=0xd92a3ce208124219667d5b17a939617cc4dc816c093b91fd80f1f164e635d5e5
+# The package's PlatformConfig (the platform fee, 0.2 % by default): the first argument of every payment.
+CONFIG=0x7e3b9a5c5346850d0703df88fcab044644c3e92b84a65e59b4661ef0e7b96106
 
 work="$(mktemp -d)"
 cleanup() { [[ -n "${srv:-}" ]] && kill "$srv" 2> /dev/null; rm -rf "$work"; }
@@ -54,9 +56,14 @@ print("\n".join([vec(q["session"].encode()), q["amount"], str(q["units"]), q["pe
 mapfile -t a <<< "$args"
 pay_amount=$(( ${a[1]} + 1000 ))
 out="$(sui client ptb --gas-budget 50000000 --json --split-coins gas "[$pay_amount]" --assign c \
-  --move-call "$PKG::chain_payments::pay" "<0x2::sui::SUI>" "@$MERCHANT" "${a[0]}" "${a[1]}" "${a[2]}" "${a[3]}" "${a[4]}" "${a[5]}" "${a[6]}" "${a[7]}" c.0 @0x6)"
+  --move-call "$PKG::chain_payments::pay" "<0x2::sui::SUI>" "@$CONFIG" "@$MERCHANT" "${a[0]}" "${a[1]}" "${a[2]}" "${a[3]}" "${a[4]}" "${a[5]}" "${a[6]}" "${a[7]}" c.0 @0x6)"
 digest="$(jq -r .digest <<< "$out")"
 echo "paid: $digest"
+# The split: the quoted amount minus 0.2 % (rounded down) to the merchant's recipient, the rest to the treasury.
+fee="$(jq -r '[.events[]? | select(.type | endswith("::chain_payments::Paid")) | (.parsedJson // .json).platform_fee] | first // "0"' <<< "$out")"
+want=$(( ${a[1]} * 20 / 10000 ))
+[[ "$fee" == "$want" ]] || { echo "FAIL: platform fee ${fee}, expected ${want} (0.2 % of ${a[1]})" >&2; exit 1; }
+echo "platform fee: $fee of ${a[1]}"
 status="$(curl -fsS -X POST "http://127.0.0.1:18080/v1/sessions/$session/payments" -H 'content-type: application/json' \
   -d "{\"nonce\":\"$(jq -r .nonce <<< "$quote")\",\"digest\":\"$digest\"}" | jq -r .status)"
 for _ in $(seq 1 10); do

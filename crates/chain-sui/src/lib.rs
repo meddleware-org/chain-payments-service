@@ -98,6 +98,9 @@ pub struct Confirmed {
     pub units: u64,
     /// 0 when the payment extended no ledger.
     pub paid_until_ms: u64,
+    /// Of `amount`, what the package sent to the platform treasury (the merchant received the rest). 0 when the fee
+    /// rounded to zero, which the event's JSON may render as an absent value.
+    pub platform_fee: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -267,6 +270,7 @@ pub fn check_response(resp: &[u8], expected: &Expected<'_>) -> Result<Confirmed,
             amount: expected.amount,
             units: expected.units,
             paid_until_ms: u64_field(json, "paid_until_ms").unwrap_or(0),
+            platform_fee: u64_field(json, "platform_fee").unwrap_or(0),
         });
     }
     Err(VerifyError::NoMatchingPayment)
@@ -277,7 +281,7 @@ mod tests {
     use super::*;
 
     fn ok(payer: &str) -> Result<Confirmed, VerifyError> {
-        Ok(Confirmed { payer: payer.into(), amount: 5, units: 1, paid_until_ms: 9 })
+        Ok(Confirmed { payer: payer.into(), amount: 5, units: 1, paid_until_ms: 9, platform_fee: 0 })
     }
 
     #[test]
@@ -326,6 +330,7 @@ mod tests {
         assert_eq!(c.payer, "0xa991ae11b0785718cd3ad1c616e804a4c083f431b3144bb845bdec651164864a");
         assert_eq!((c.amount, c.units), (1000, 1));
         assert!(c.paid_until_ms > 0);
+        assert_eq!(c.platform_fee, 0, "recorded from the first package, before the platform fee");
         for wrong in [
             Expected { amount: 999, ..expected() },
             Expected { session: "other", ..expected() },

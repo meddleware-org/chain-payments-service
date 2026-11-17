@@ -183,7 +183,11 @@ impl App {
         };
         let now = Utc::now();
         match chain.verify_payment(digest, &expected).await {
-            Ok(c) => match self.store.confirm_payment(digest, nonce, &c.payer, c.paid_until_ms as i64, now).await? {
+            Ok(c) => match self
+                .store
+                .confirm_payment(digest, nonce, &c.payer, c.paid_until_ms as i64, c.platform_fee, now)
+                .await?
+            {
                 Settled::Confirmed => {
                     Metrics::inc(&self.metrics.payments_confirmed);
                     tracing::info!(session = %q.session_id, %digest, "payment confirmed");

@@ -2,6 +2,10 @@
 
 ## Unreleased (first pass of the security audit, 2026-11-17; ships in the first tag, 0.0.1)
 
+- The testnet package is `0x610cf31f…6af2` (fresh, immutable, with the platform fee). `Paid.platform_fee` is read into
+  `Confirmed.platform_fee` and sent to the merchant as `platformFee` in `session.paid` and `payment.unapplied`.
+  `scripts/e2e-testnet.sh` passes the `PlatformConfig` and checks the fee (live run 2026-11-17: tx
+  `33nefFTR2NG3LcCYzpnRjEsvu6gBTNhgMeDc9EyCqvFa`, fee 35 942 of 17 971 067 MIST).
 - A payment for a session already paid or cancelled is `unapplied` (not `rejected`) and the merchant gets a
   `payment.unapplied` webhook in the same transaction (migration 0003).
 - Several full nodes per network, which must agree before a payment counts; mainnet requires two on different hosts.

@@ -432,6 +432,7 @@ impl Store {
         nonce: &str,
         payer: &str,
         paid_until_ms: i64,
+        platform_fee: u64,
         now: DateTime<Utc>,
     ) -> Result<Settled, DbError> {
         let mut tx = self.pool.begin().await?;
@@ -501,6 +502,8 @@ impl Store {
                 "digest": digest,
                 "payer": payer,
                 "paidUntilMs": paid_until_ms,
+                // In the coin's smallest unit, out of `amount`: the merchant's recipient received `amount - platformFee`.
+                "platformFee": platform_fee.to_string(),
             });
             enqueue(&mut tx, merchant_id, event, &payload).await?;
         }
@@ -735,14 +738,14 @@ mod tests {
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::New);
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::AlreadyKnown);
         assert_eq!(s.submit_payment("D2", &session, &nonce).await.unwrap(), Submitted::New);
-        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::Confirmed);
+        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(), Settled::Confirmed);
         assert_eq!(
-            s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(),
+            s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(),
             Settled::Already("confirmed".into()),
             "a second settlement of the same claim reports the first one's outcome, not a rejection"
         );
         assert_eq!(
-            s.confirm_payment("D2", &nonce, "0xother", 43, Utc::now()).await.unwrap(),
+            s.confirm_payment("D2", &nonce, "0xother", 43, 7, Utc::now()).await.unwrap(),
             Settled::Unapplied,
             "a second payment is not a second sale"
         );
@@ -760,6 +763,7 @@ mod tests {
         s.webhook_delivered(hooks[0].id, Utc::now()).await.unwrap();
         hooks.remove(0);
         assert_eq!(hooks[0].payload["paidUntilMs"], 42);
+        assert_eq!(hooks[0].payload["platformFee"], "7");
         assert_eq!(hooks[0].payload["metadata"]["a"], 1);
         assert!(s.claim_webhooks(Utc::now(), 10, 60).await.unwrap().is_empty(), "leased");
         s.webhook_delivered(hooks[0].id, Utc::now()).await.unwrap();
@@ -777,7 +781,7 @@ mod tests {
         assert_eq!(s.session_payment_status(&session, "D1").await.unwrap().as_deref(), Some("rejected"));
         // The payer's own claim is a new record and is confirmed.
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::New);
-        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::Confirmed);
+        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(), Settled::Confirmed);
         assert_eq!(s.session_payment_status(&session, "D1").await.unwrap().as_deref(), Some("confirmed"));
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "paid");
         assert!(s.session_payment_status(&session, "D9").await.unwrap().is_none());
@@ -789,7 +793,7 @@ mod tests {
         let (m, session, nonce) = fixture(&s).await;
         assert!(s.cancel_session(m, &session).await.unwrap());
         s.submit_payment("D1", &session, &nonce).await.unwrap();
-        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, Utc::now()).await.unwrap(), Settled::Unapplied);
+        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(), Settled::Unapplied);
         let p = s.payment("D1", &nonce).await.unwrap().unwrap();
         assert_eq!((p.status.as_str(), p.payer.as_deref()), ("unapplied", Some("0xpayer")));
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "cancelled", "the session is not sold");

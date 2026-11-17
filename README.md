@@ -30,7 +30,8 @@ Merchant (port 8081, `Authorization: Bearer <key>`): `POST /v1/merchant/sessions
 
 Webhooks: `POST` to the merchant's URL with `chain-payments-signature: t=<unix>,ed25519=<base64 of "<t>.<body>">` and
 `chain-payments-event-id`; events `session.paid` (digest, payer, coin amount, price record, `paidUntilMs`),
-`session.expired`, and `payment.unapplied` (the same fields and `sessionStatus`): a transaction paid a quote of a session
+`session.expired`, and `payment.unapplied` (each paid event also carries `platformFee`: of the coin amount, what the
+package sent to the platform treasury; the recipient received the rest) (the same fields and `sessionStatus`): a transaction paid a quote of a session
 that was already paid or cancelled. The coins are the merchant's; the merchant credits the buyer or refunds them by hand.
 Nothing is refunded automatically, so paying stale quotes cannot make a merchant spend network fees.
 

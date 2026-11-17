@@ -606,7 +606,7 @@ mount `chain-payments-keys`.
 
 ### F28 — A payment for a session that is already paid or cancelled is kept silently
 
-**Severity:** Low   **Disposition:** DEFERRED (FU-0127; decision OQ1)
+**Severity:** Low   **Disposition:** RESOLVED (2026-11-17: `unapplied` status and `payment.unapplied` webhook, migration 0003; store tests `a_payment_for_a_cancelled_session_is_unapplied_and_the_merchant_is_told` and the second-payment case)
 **Where:** `Store::confirm_payment` (`UPDATE … WHERE status IN ('open', 'expired')`; otherwise the claim is `rejected`);
 `cp.webhooks.event` CHECK allows `session.paid` and `session.expired` only.
 **Issue:** These situations all produce a valid on-chain payment for a session that can no longer be sold:
@@ -880,7 +880,7 @@ Not covered by tests:
 - MUST NOT let one claim of a digest decide another — **holds** (F1).
 - MUST NOT reject a payment because of our own node's unavailability — **holds** (F2).
 - MUST eventually recognise every on-chain payment to a registry merchant, submitted or not — **does not hold** (F24).
-- MUST tell the merchant about every payment it received, including those it cannot sell — **does not hold** (F28, OQ1).
+- MUST tell the merchant about every payment it received, including those it cannot sell — **holds** since 2026-11-17 (`payment.unapplied`; F28).
 - MUST NOT quote without two agreeing sources — **holds** (F5, F14).
 - RS-M1 holds (F7, I19) · RS-M2 n/a (the service verifies no Sui signatures; it signs ed25519 with `ring`) · RS-M3 holds in
   the shared core (fuzzed there) · RS-M4 holds (F6) · RS-M5 holds · RS-M6 holds (single use is SQL row state; the database
@@ -910,18 +910,20 @@ Not covered by tests:
 
 ## Open questions (`OQ#`)
 
-- **OQ1** — What happens to a payment that cannot be sold (session already paid, cancelled, or expired for good)? Choose: (a)
-  a `payment.unapplied` webhook so the merchant refunds or credits; (b) the operator refunds from the recipient; (c) apply
-  it as credit to the subscription reference automatically. (F28)
-- **OQ2** — Will merchants ever be created by anyone but the operator? If yes, webhook URLs need a private-address refusal
-  and a verification step, and merchant creation needs its own role. (F17, F26)
-- **OQ3** — Which mainnet full node: the public Mysten endpoint, or a paid or self-run one with an SLA? Settlement liveness
-  depends on it (F2).
+- **OQ1** — DECIDED 2026-11-17 (maintainer): no automatic refunds. The payment is `unapplied` and the merchant gets a
+  `payment.unapplied` webhook in the same transaction (migration 0003); the merchant credits it or refunds it by hand.
+  Link in Bio credits it. (F28, now RESOLVED in code)
+- **OQ2** — DECIDED 2026-11-17: not yet. Merchants are created by the operator only. Self-service merchants are stage 2 of
+  the payments-layer plan, and their prerequisites (webhook private-address refusal and verification, a merchant role,
+  legal advice) are FU-0133. (F17, F26)
+- **OQ3** — DECIDED 2026-11-17: several full nodes per network, which must agree before a payment counts; mainnet requires
+  two on different hosts (Mysten's public node and one independent provider). Implemented (`chain_sui::agree`, config
+  checks). (F2)
 
 ## Risks (residual)
 
-- **A lying full node:** the service trusts one configured node's `GetTransaction`. A malicious or compromised node could
-  report a payment that did not happen. Checking a second node before confirming large amounts would bound it.
+- **A lying full node:** with two nodes (required on mainnet) both must agree, so one lying node cannot credit a payment
+  or hide one. Two colluding or both-compromised nodes remain a residual risk; testnet runs on one node.
 - **Price sources:** a coordinated 2 % move of every source, or all three down (no quotes).
 - **Keys on the node:** custody of the quote and webhook seeds is the platform's (SOPS, age).
 - **Link in Bio's trust-on-first-use webhook key:** fetched in-cluster over plain HTTP from the Service (NetworkPolicies

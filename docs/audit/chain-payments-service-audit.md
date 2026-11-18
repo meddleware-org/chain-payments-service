@@ -131,7 +131,7 @@ signed with its key (merchant object, session, nonce, coin type, amount, units, 
 
 | Actor | Controls | Bounded by |
 | --- | --- | --- |
-| Network client | request line, headers, ≤ 4 KiB (public) / 16 KiB (merchant) bodies, timing | `DefaultBodyLimit`; nginx `client-max-body-size 4k`; `TimeoutLayer` 30 s; `ConcurrencyLimitLayer` 64 (F6); hyper's header limits |
+| Network client | request line, headers, ≤ 4 KiB (public) / 16 KiB (merchant) bodies, timing | `DefaultBodyLimit`; nginx `client-max-body-size 4k`; `TimeoutLayer` 30 s; `GlobalConcurrencyLimitLayer` 64 per process (F6); hyper's header limits |
 | Upstream services (price sources, merchant webhook endpoints) | response size, status, timing | 6 s / 10 s timeouts, no redirects, no proxy; price bodies ≤ 64 KiB; webhook responses not read |
 | Sui full node (gRPC-web) | frames the decoder parses | `access-gate-gateway-core` decoder: frame and message caps (`MAX_GRPC_MESSAGE_BYTES`), bounded varints and recursion (`MAX_VALUE_DEPTH`), required `grpc-status`; fuzzed in that crate |
 | Shared state (PostgreSQL) | claim and session state; availability | row locks and status predicates; readiness fails on loss (DB lens) |
@@ -324,6 +324,10 @@ unused.
 **Remediation / evidence:** Both routers get `TimeoutLayer` (30 s, `408`) and `ConcurrencyLimitLayer(64)`. Body caps are
 4 KiB and 16 KiB, so 64 requests hold well under a megabyte; the DB pool (4) and the full node queue behind the limit.
 Existing router tests pass through the layers.
+**Correction (0.0.4, 2026-11-18, FU-0143):** `Router::layer` wraps each route separately and `ConcurrencyLimitLayer` makes a
+semaphore per wrap, so the 64 held per route, not per process (found by the link-in-bio-service audit). Both routers now use
+`GlobalConcurrencyLimitLayer` (`per_process_limit`), one semaphore for every route. Test:
+`api::limit_tests::the_limit_is_shared_by_every_route` (it fails with the per-route layer).
 
 ### F7 — `unsafe_code` was `deny`, not `forbid`
 
@@ -687,7 +691,7 @@ Tracked in FU-0130.
 | I15 | Values bound as parameters; no string-built SQL with values | `store` | inspection; every query static | HOLDS (code-only) |
 | I16 | Database transport is `verify-full` only (or an explicit local switch) | `DatabaseSettings::parse` | `every_weaker_tls_setting_is_refused` | HOLDS |
 | I17 | Least privilege between processes (role and keys) | — | — | GAP (F26, F27) |
-| I18 | Requests are bounded in size, time and concurrency | `DefaultBodyLimit`; `TimeoutLayer`; `ConcurrencyLimitLayer` | router tests pass through the layers | HOLDS (F6; code-only for the bounds themselves) |
+| I18 | Requests are bounded in size, time and concurrency | `DefaultBodyLimit`; `TimeoutLayer`; `GlobalConcurrencyLimitLayer` | router tests pass through the layers; `limit_tests` proves one limit per process | HOLDS (F6; code-only for the bounds themselves) |
 | I19 | No panic on attacker input; no `unsafe` | `forbid(unsafe_code)`; checked arithmetic; `release` `overflow-checks = true`, `panic = "abort"` | clippy; inspection | HOLDS (code-only) |
 | I20 | Secrets never in logs or `Debug` | `Signer` Debug prints the public key; `DatabaseSettings` Debug redacts | `the_password_never_appears_in_debug_or_errors` | HOLDS |
 

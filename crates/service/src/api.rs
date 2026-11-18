@@ -17,7 +17,7 @@ use chain_payments_core::session::{DEFAULT_SESSION_SECS, NewSession, random_id};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::app::{App, OpError, Shared};
@@ -193,8 +193,15 @@ pub fn public_router(app: Shared) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), public_guard))
         .layer(DefaultBodyLimit::max(4 * 1024))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
-        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+        .layer(per_process_limit(MAX_CONCURRENT_REQUESTS))
         .with_state(app)
+}
+
+/// One request limit for every route of a router. `Router::layer` wraps each route separately, and
+/// `ConcurrencyLimitLayer` makes a new semaphore each time it wraps, so it would allow `max` per route. The global layer
+/// shares one semaphore across every route.
+pub(crate) fn per_process_limit(max: usize) -> GlobalConcurrencyLimitLayer {
+    GlobalConcurrencyLimitLayer::new(max)
 }
 
 // ── merchant ─────────────────────────────────────────────────────────────────
@@ -312,11 +319,40 @@ pub fn merchant_router(app: Shared) -> Router {
         .route("/healthz", get(healthz))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
-        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+        .layer(per_process_limit(MAX_CONCURRENT_REQUESTS))
         .with_state(app)
 }
 
 /// The worker's own port: its counters (confirmations, webhook deliveries) live in its process, so it serves them itself.
 pub fn worker_router(app: Shared) -> Router {
     Router::new().route("/metrics", get(metrics)).route("/healthz", get(healthz)).with_state(app)
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use std::time::{Duration, Instant};
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    async fn slow() -> StatusCode {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_shared_by_every_route() {
+        let r: Router = Router::new().route("/a", get(slow)).route("/b", get(slow)).layer(super::per_process_limit(1));
+        let started = Instant::now();
+        let (a, b) = tokio::join!(
+            r.clone().oneshot(Request::get("/a").body(Body::empty()).unwrap()),
+            r.clone().oneshot(Request::get("/b").body(Body::empty()).unwrap()),
+        );
+        assert_eq!(a.unwrap().status(), StatusCode::OK);
+        assert_eq!(b.unwrap().status(), StatusCode::OK);
+        assert!(started.elapsed() >= Duration::from_millis(400), "two routes, one limit: they ran one after the other");
+    }
 }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.4 — 2026-11-18
+
+- The request limit (64) is per process, as intended: it was per route, because `Router::layer` wraps each route and
+  `ConcurrencyLimitLayer` gives each wrap its own semaphore. Both routers use `GlobalConcurrencyLimitLayer` now, with a
+  test (FU-0143).
+
 ## 0.0.3 — 2026-11-17
 
 - Dates and times use the `time` crate (and sqlx's `time` support) instead of `chrono`, which RUSTSEC-2026-0543 marks

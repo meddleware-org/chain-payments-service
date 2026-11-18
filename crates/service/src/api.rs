@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use chain_payments_core::money::format_gbp;
 use chain_payments_core::session::{DEFAULT_SESSION_SECS, NewSession, random_id};
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
@@ -59,7 +59,7 @@ async fn get_session(State(app): State<Shared>, Path(id): Path<String>) -> Resul
         return Err(OpError::NotFound);
     }
     let s = app.store.session(&id).await?.ok_or(OpError::NotFound)?;
-    let open = s.status == "open" && s.expires_at > Utc::now();
+    let open = s.status == "open" && s.expires_at > OffsetDateTime::now_utc();
     let methods: Vec<Value> = s.methods.iter().filter_map(|m| app.method(m)).map(App::method_json).collect();
     Ok(Json(json!({
         "id": s.id,
@@ -68,7 +68,7 @@ async fn get_session(State(app): State<Shared>, Path(id): Path<String>) -> Resul
         "amountText": format_gbp(s.amount_pence as u64),
         "description": s.description,
         "units": s.units,
-        "expiresAt": s.expires_at.to_rfc3339(),
+        "expiresAt": crate::rfc3339(s.expires_at),
         "methods": methods,
     }))
     .into_response())
@@ -235,7 +235,8 @@ async fn create_session(State(app): State<Shared>, headers: HeaderMap, body: axu
         return error(StatusCode::UNPROCESSABLE_ENTITY, "no enabled payment method");
     }
     let id = random_id(16);
-    let expires = Utc::now() + chrono::Duration::seconds(n.expires_in_secs.unwrap_or(DEFAULT_SESSION_SECS) as i64);
+    let expires =
+        OffsetDateTime::now_utc() + time::Duration::seconds(n.expires_in_secs.unwrap_or(DEFAULT_SESSION_SECS) as i64);
     let r = app
         .store
         .create_session(
@@ -254,7 +255,7 @@ async fn create_session(State(app): State<Shared>, headers: HeaderMap, body: axu
     match r {
         Ok(()) => {
             Metrics::inc(&app.metrics.sessions_created);
-            (StatusCode::CREATED, Json(json!({ "id": id, "expiresAt": expires.to_rfc3339(), "methods": methods })))
+            (StatusCode::CREATED, Json(json!({ "id": id, "expiresAt": crate::rfc3339(expires), "methods": methods })))
                 .into_response()
         }
         Err(e) => OpError::Store(e).into_response(),
@@ -274,8 +275,8 @@ async fn merchant_session(State(app): State<Shared>, headers: HeaderMap, Path(id
     let payments = app.store.session_payments(&id).await.unwrap_or_default();
     Json(json!({
         "id": s.id, "status": s.status, "amountPence": s.amount_pence, "units": s.units,
-        "subscriptionRef": s.subscription_ref, "metadata": s.metadata, "expiresAt": s.expires_at.to_rfc3339(),
-        "paidAt": s.paid_at.map(|t| t.to_rfc3339()),
+        "subscriptionRef": s.subscription_ref, "metadata": s.metadata, "expiresAt": crate::rfc3339(s.expires_at),
+        "paidAt": s.paid_at.map(crate::rfc3339),
         "payments": payments.iter().map(|p| json!({ "digest": p.digest, "status": p.status, "payer": p.payer, "paidUntilMs": p.paid_until_ms })).collect::<Vec<_>>(),
     }))
     .into_response()

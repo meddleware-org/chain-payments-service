@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.3 — 2026-11-17
+
+- Dates and times use the `time` crate (and sqlx's `time` support) instead of `chrono`, which RUSTSEC-2026-0543 marks
+  unmaintained; `chrono` is no longer in the dependency tree and `deny.toml` no longer lists the advisory (FU-0134).
+  Timestamps in the API and webhooks are RFC 3339 in UTC with a `Z` suffix.
+
 ## 0.0.2 — 2026-11-17
 
 - **Unsubmitted payments are found** (FU-0124). The worker reads each package's `Paid` events through GraphQL

@@ -204,7 +204,16 @@ async fn a_merchant_changed_on_chain_gets_no_quotes() {
     let quote = || post(&format!("/v1/sessions/{id}/quotes"), json!({"method": "sui-testnet:GBPT"}), None);
     // The worker read a pending recipient on the merchant object: quoting stops.
     app.store
-        .record_merchant_watch("0x30b6", "0xa1", Some("0xbeef"), "aa", false, false, false, chrono::Utc::now())
+        .record_merchant_watch(
+            "0x30b6",
+            "0xa1",
+            Some("0xbeef"),
+            "aa",
+            false,
+            false,
+            false,
+            time::OffsetDateTime::now_utc(),
+        )
         .await
         .unwrap();
     let (st, _, e) = call(p.clone(), quote()).await;
@@ -212,7 +221,7 @@ async fn a_merchant_changed_on_chain_gets_no_quotes() {
     assert!(e["error"].as_str().unwrap().contains("pending"), "{e}");
     // Back to normal: quotes again.
     app.store
-        .record_merchant_watch("0x30b6", "0xa1", None, "aa", false, false, false, chrono::Utc::now())
+        .record_merchant_watch("0x30b6", "0xa1", None, "aa", false, false, false, time::OffsetDateTime::now_utc())
         .await
         .unwrap();
     assert_eq!(call(p.clone(), quote()).await.0, StatusCode::OK);

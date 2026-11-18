@@ -3,11 +3,11 @@
 
 pub mod config;
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub use sqlx::Error as DbError;
@@ -40,8 +40,8 @@ pub struct Session {
     pub methods: Vec<String>,
     pub metadata: Value,
     pub status: String,
-    pub expires_at: DateTime<Utc>,
-    pub paid_at: Option<DateTime<Utc>>,
+    pub expires_at: OffsetDateTime,
+    pub paid_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,7 +234,7 @@ impl Store {
         period_ms: i64,
         methods: &[String],
         metadata: &Value,
-        expires_at: DateTime<Utc>,
+        expires_at: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO cp.sessions (id, merchant_id, amount_pence, description, units, subscription_ref, period_ms, \
@@ -277,7 +277,7 @@ impl Store {
 
     /// Marks open sessions past their expiry as expired and queues a `session.expired` webhook for each. Returns how
     /// many. A session with a pending payment is left open (the watcher settles it first).
-    pub async fn expire_sessions(&self, now: DateTime<Utc>) -> Result<u64, DbError> {
+    pub async fn expire_sessions(&self, now: OffsetDateTime) -> Result<u64, DbError> {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query(
             "UPDATE cp.sessions s SET status = 'expired' WHERE s.status = 'open' AND s.expires_at <= $1 \
@@ -338,14 +338,14 @@ impl Store {
     }
 
     /// When a claim was first submitted (the watcher gives up on a transaction nobody can find after a while).
-    pub async fn payment_age_secs(&self, digest: &str, nonce: &str, now: DateTime<Utc>) -> Result<i64, DbError> {
-        let created: DateTime<Utc> =
+    pub async fn payment_age_secs(&self, digest: &str, nonce: &str, now: OffsetDateTime) -> Result<i64, DbError> {
+        let created: OffsetDateTime =
             sqlx::query_scalar("SELECT created_at FROM cp.payments WHERE digest = $1 AND nonce = $2")
                 .bind(digest)
                 .bind(nonce)
                 .fetch_one(&self.pool)
                 .await?;
-        Ok((now - created).num_seconds())
+        Ok((now - created).whole_seconds())
     }
 
     pub async fn quote(&self, nonce: &str) -> Result<Option<Quote>, DbError> {
@@ -432,7 +432,7 @@ impl Store {
         paused: bool,
         recipient_unexpected: bool,
         quote_key_foreign: bool,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO cp.merchant_watch (merchant_object, recipient, pending_recipient, quote_key, paused, \
@@ -539,7 +539,7 @@ impl Store {
     }
 
     /// Pending payments due for a check (the watcher), oldest first.
-    pub async fn due_payments(&self, now: DateTime<Utc>, limit: i64) -> Result<Vec<Payment>, DbError> {
+    pub async fn due_payments(&self, now: OffsetDateTime, limit: i64) -> Result<Vec<Payment>, DbError> {
         let rows = sqlx::query(
             "SELECT digest, session_id, nonce, status, payer, paid_until_ms, attempts FROM cp.payments \
              WHERE status = 'pending' AND next_check_at <= $1 ORDER BY next_check_at LIMIT $2",
@@ -561,7 +561,7 @@ impl Store {
         payer: &str,
         paid_until_ms: i64,
         platform_fee: u64,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Settled, DbError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
@@ -645,11 +645,11 @@ impl Store {
         digest: &str,
         nonce: &str,
         error: &str,
-        retry_at: Option<DateTime<Utc>>,
+        retry_at: Option<OffsetDateTime>,
     ) -> Result<(), DbError> {
         let (status, next) = match retry_at {
             Some(t) => ("pending", t),
-            None => ("rejected", Utc::now()),
+            None => ("rejected", OffsetDateTime::now_utc()),
         };
         sqlx::query(
             "UPDATE cp.payments SET status = $3, attempts = attempts + 1, last_error = $4, next_check_at = $5 \
@@ -671,7 +671,7 @@ impl Store {
     /// `lease_secs`, so a crash mid-delivery retries later instead of never.
     pub async fn claim_webhooks(
         &self,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         limit: i64,
         lease_secs: i64,
     ) -> Result<Vec<Webhook>, DbError> {
@@ -698,7 +698,7 @@ impl Store {
             .collect()
     }
 
-    pub async fn webhook_delivered(&self, id: Uuid, now: DateTime<Utc>) -> Result<(), DbError> {
+    pub async fn webhook_delivered(&self, id: Uuid, now: OffsetDateTime) -> Result<(), DbError> {
         sqlx::query("UPDATE cp.webhooks SET delivered_at = $2, last_error = NULL WHERE id = $1")
             .bind(id)
             .bind(now)
@@ -707,7 +707,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn webhook_failed(&self, id: Uuid, error: &str, next_at: DateTime<Utc>) -> Result<(), DbError> {
+    pub async fn webhook_failed(&self, id: Uuid, error: &str, next_at: OffsetDateTime) -> Result<(), DbError> {
         sqlx::query("UPDATE cp.webhooks SET last_error = $2, next_at = $3 WHERE id = $1")
             .bind(id)
             .bind(error)
@@ -806,7 +806,7 @@ mod tests {
             2_629_800_000,
             &["sui-testnet:SUI".into()],
             &serde_json::json!({"a": 1}),
-            Utc::now() + chrono::Duration::minutes(30),
+            OffsetDateTime::now_utc() + time::Duration::minutes(30),
         )
         .await
         .unwrap();
@@ -866,20 +866,23 @@ mod tests {
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::New);
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::AlreadyKnown);
         assert_eq!(s.submit_payment("D2", &session, &nonce).await.unwrap(), Submitted::New);
-        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(), Settled::Confirmed);
         assert_eq!(
-            s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(),
+            s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, OffsetDateTime::now_utc()).await.unwrap(),
+            Settled::Confirmed
+        );
+        assert_eq!(
+            s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, OffsetDateTime::now_utc()).await.unwrap(),
             Settled::Already("confirmed".into()),
             "a second settlement of the same claim reports the first one's outcome, not a rejection"
         );
         assert_eq!(
-            s.confirm_payment("D2", &nonce, "0xother", 43, 7, Utc::now()).await.unwrap(),
+            s.confirm_payment("D2", &nonce, "0xother", 43, 7, OffsetDateTime::now_utc()).await.unwrap(),
             Settled::Unapplied,
             "a second payment is not a second sale"
         );
         assert_eq!(s.payment("D2", &nonce).await.unwrap().unwrap().status, "unapplied");
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "paid");
-        let mut hooks = s.claim_webhooks(Utc::now(), 10, 60).await.unwrap();
+        let mut hooks = s.claim_webhooks(OffsetDateTime::now_utc(), 10, 60).await.unwrap();
         assert_eq!(hooks.len(), 2, "the sale, and the merchant is told about the second payment");
         hooks.sort_by_key(|h| h.event.clone());
         assert_eq!(hooks[0].event, "payment.unapplied");
@@ -888,14 +891,16 @@ mod tests {
             (Some("0xother"), Some("D2"))
         );
         assert_eq!(hooks[0].payload["sessionStatus"], "paid");
-        s.webhook_delivered(hooks[0].id, Utc::now()).await.unwrap();
+        s.webhook_delivered(hooks[0].id, OffsetDateTime::now_utc()).await.unwrap();
         hooks.remove(0);
         assert_eq!(hooks[0].payload["paidUntilMs"], 42);
         assert_eq!(hooks[0].payload["platformFee"], "7");
         assert_eq!(hooks[0].payload["metadata"]["a"], 1);
-        assert!(s.claim_webhooks(Utc::now(), 10, 60).await.unwrap().is_empty(), "leased");
-        s.webhook_delivered(hooks[0].id, Utc::now()).await.unwrap();
-        assert!(s.claim_webhooks(Utc::now() + chrono::Duration::minutes(5), 10, 60).await.unwrap().is_empty());
+        assert!(s.claim_webhooks(OffsetDateTime::now_utc(), 10, 60).await.unwrap().is_empty(), "leased");
+        s.webhook_delivered(hooks[0].id, OffsetDateTime::now_utc()).await.unwrap();
+        assert!(
+            s.claim_webhooks(OffsetDateTime::now_utc() + time::Duration::minutes(5), 10, 60).await.unwrap().is_empty()
+        );
     }
 
     #[tokio::test]
@@ -909,7 +914,10 @@ mod tests {
         assert_eq!(s.session_payment_status(&session, "D1").await.unwrap().as_deref(), Some("rejected"));
         // The payer's own claim is a new record and is confirmed.
         assert_eq!(s.submit_payment("D1", &session, &nonce).await.unwrap(), Submitted::New);
-        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(), Settled::Confirmed);
+        assert_eq!(
+            s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, OffsetDateTime::now_utc()).await.unwrap(),
+            Settled::Confirmed
+        );
         assert_eq!(s.session_payment_status(&session, "D1").await.unwrap().as_deref(), Some("confirmed"));
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "paid");
         assert!(s.session_payment_status(&session, "D9").await.unwrap().is_none());
@@ -921,11 +929,14 @@ mod tests {
         let (m, session, nonce) = fixture(&s).await;
         assert!(s.cancel_session(m, &session).await.unwrap());
         s.submit_payment("D1", &session, &nonce).await.unwrap();
-        assert_eq!(s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, Utc::now()).await.unwrap(), Settled::Unapplied);
+        assert_eq!(
+            s.confirm_payment("D1", &nonce, "0xpayer", 42, 7, OffsetDateTime::now_utc()).await.unwrap(),
+            Settled::Unapplied
+        );
         let p = s.payment("D1", &nonce).await.unwrap().unwrap();
         assert_eq!((p.status.as_str(), p.payer.as_deref()), ("unapplied", Some("0xpayer")));
         assert_eq!(s.session(&session).await.unwrap().unwrap().status, "cancelled", "the session is not sold");
-        let hooks = s.claim_webhooks(Utc::now(), 10, 60).await.unwrap();
+        let hooks = s.claim_webhooks(OffsetDateTime::now_utc(), 10, 60).await.unwrap();
         assert_eq!(hooks.len(), 1);
         assert_eq!(
             (hooks[0].event.as_str(), hooks[0].payload["sessionStatus"].as_str()),
@@ -949,7 +960,7 @@ mod tests {
         let Some(s) = store().await else { return };
         let (_, session, nonce) = fixture(&s).await;
         s.submit_payment("D1", &session, &nonce).await.unwrap();
-        let later = Utc::now() + chrono::Duration::hours(1);
+        let later = OffsetDateTime::now_utc() + time::Duration::hours(1);
         assert_eq!(s.expire_sessions(later).await.unwrap(), 0, "a pending payment holds the session open");
         s.payment_not_confirmed("D1", &nonce, "the transaction failed", None).await.unwrap();
         assert_eq!(s.expire_sessions(later).await.unwrap(), 1);
@@ -963,11 +974,16 @@ mod tests {
         let Some(s) = store().await else { return };
         let (_, session, nonce) = fixture(&s).await;
         s.submit_payment("D1", &session, &nonce).await.unwrap();
-        assert_eq!(s.due_payments(Utc::now() + chrono::Duration::seconds(1), 10).await.unwrap().len(), 1);
-        s.payment_not_confirmed("D1", &nonce, "not found yet", Some(Utc::now() + chrono::Duration::minutes(1)))
-            .await
-            .unwrap();
-        assert!(s.due_payments(Utc::now(), 10).await.unwrap().is_empty());
+        assert_eq!(s.due_payments(OffsetDateTime::now_utc() + time::Duration::seconds(1), 10).await.unwrap().len(), 1);
+        s.payment_not_confirmed(
+            "D1",
+            &nonce,
+            "not found yet",
+            Some(OffsetDateTime::now_utc() + time::Duration::minutes(1)),
+        )
+        .await
+        .unwrap();
+        assert!(s.due_payments(OffsetDateTime::now_utc(), 10).await.unwrap().is_empty());
         let first = s.try_watcher_lock().await.unwrap();
         assert!(first.is_some());
         assert!(s.try_watcher_lock().await.unwrap().is_none(), "one writer");

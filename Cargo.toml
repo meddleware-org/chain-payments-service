@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/chain-sui", "crates/store", "crates/service", "crates/cli"]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.94"
 license = "0BSD"
@@ -18,7 +18,7 @@ chain-payments-store = { path = "crates/store" }
 chain-payments-service = { path = "crates/service" }
 
 access-gate-gateway-core = "=0.0.33"
-sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "chrono", "uuid"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tower-log"] }
 tower = { version = "=0.5.3", default-features = false, features = ["util", "limit", "timeout"] }
 tower-http = { version = "=0.7.1", default-features = false, features = ["timeout", "limit"] }
@@ -31,7 +31,7 @@ anyhow = "=1.0.104"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
 url = "=2.5.8"
-chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing"] }
 uuid = { version = "=1.29.0", default-features = false, features = ["std", "v4", "serde"] }
 base64 = "=0.23.1"
 hex = "=0.4.3"

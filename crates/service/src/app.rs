@@ -10,8 +10,8 @@ use chain_payments_core::quote::QuoteFields;
 use chain_payments_core::registry::Method;
 use chain_payments_core::session::random_id;
 use chain_payments_store::{Quote, Settled, Store};
-use chrono::Utc;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::metrics::Metrics;
@@ -82,7 +82,7 @@ impl App {
     /// Signs a quote for an open session in one of its methods.
     pub async fn quote(&self, session_id: &str, method_id: &str) -> Result<Value, OpError> {
         let s = self.store.session(session_id).await?.ok_or(OpError::NotFound)?;
-        if s.status != "open" || s.expires_at <= Utc::now() {
+        if s.status != "open" || s.expires_at <= OffsetDateTime::now_utc() {
             return Err(OpError::Refused("this checkout is no longer open".into()));
         }
         if !s.methods.iter().any(|m| m == method_id) {
@@ -105,7 +105,7 @@ impl App {
                     "pricePico": a.price_pico.to_string(),
                     "spreadBps": a.spread_bps.to_string(),
                     "samples": a.samples.iter().map(|x| json!({ "source": x.source, "pricePico": x.price_pico.to_string() })).collect::<Vec<_>>(),
-                    "at": Utc::now().to_rfc3339(),
+                    "at": crate::rfc3339(OffsetDateTime::now_utc()),
                 }),
                 Err(e) => {
                     Metrics::inc(&self.metrics.price_failures);
@@ -122,8 +122,8 @@ impl App {
             return Err(OpError::Refused("the amount is out of range".into()));
         }
         let nonce = random_id(16);
-        let expires_ms =
-            (Utc::now().timestamp_millis() as u64).saturating_add(self.config.quote_ttl.as_millis() as u64);
+        let expires_ms = (OffsetDateTime::now_utc().unix_timestamp_nanos() as u64 / 1_000_000)
+            .saturating_add(self.config.quote_ttl.as_millis() as u64);
         let fields = QuoteFields {
             merchant_id: format!("{:0>64}", m.merchant_object.trim_start_matches("0x")),
             session: s.id.clone(),
@@ -193,7 +193,7 @@ impl App {
             units: s.units as u64,
             subscription_ref: &s.subscription_ref,
         };
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         match chain.verify_payment(digest, &expected).await {
             Ok(c) => match self
                 .store
@@ -222,12 +222,7 @@ impl App {
                 }
                 let backoff = 2i64.saturating_pow((p.attempts.clamp(0, 8)) as u32).min(300);
                 self.store
-                    .payment_not_confirmed(
-                        digest,
-                        nonce,
-                        &e.to_string(),
-                        Some(now + chrono::Duration::seconds(backoff)),
-                    )
+                    .payment_not_confirmed(digest, nonce, &e.to_string(), Some(now + time::Duration::seconds(backoff)))
                     .await?;
                 Ok("pending".into())
             }

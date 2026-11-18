@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use chain_payments_core::webhook;
 use chain_payments_store::Webhook;
-use chrono::Utc;
+use time::OffsetDateTime;
 
 use crate::app::Shared;
 use crate::metrics::Metrics;
@@ -38,7 +38,7 @@ pub fn webhook_url_allowed(url: &str) -> bool {
 }
 
 async fn deliver(app: &Shared, client: &reqwest::Client, w: &Webhook) {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let url = match app.store.merchant(w.merchant_id).await {
         Ok(Some(m)) => m.webhook_url,
         _ => None,
@@ -54,7 +54,7 @@ async fn deliver(app: &Shared, client: &reqwest::Client, w: &Webhook) {
         tracing::error!("this process does not hold the webhook key; webhooks are left for the worker");
         return;
     };
-    let sig = webhook::sign(signer, now.timestamp() as u64, &body);
+    let sig = webhook::sign(signer, now.unix_timestamp() as u64, &body);
     let r = client
         .post(&url)
         .header("content-type", "application/json")
@@ -76,10 +76,10 @@ async fn deliver(app: &Shared, client: &reqwest::Client, w: &Webhook) {
             };
             if w.attempts >= MAX_WEBHOOK_ATTEMPTS {
                 tracing::error!(id = %w.id, %reason, "webhook gave up; left in the outbox");
-                let _ = app.store.webhook_failed(w.id, &reason, now + chrono::Duration::days(3650)).await;
+                let _ = app.store.webhook_failed(w.id, &reason, now + time::Duration::days(3650)).await;
             } else {
                 let backoff = (10i64 * 2i64.saturating_pow(w.attempts.clamp(0, 12) as u32)).min(6 * 3600);
-                let _ = app.store.webhook_failed(w.id, &reason, now + chrono::Duration::seconds(backoff)).await;
+                let _ = app.store.webhook_failed(w.id, &reason, now + time::Duration::seconds(backoff)).await;
             }
         }
     }
@@ -97,7 +97,7 @@ fn graphql_client() -> anyhow::Result<reqwest::Client> {
 
 /// One pass of every duty (also what the tests call).
 pub async fn tick(app: &Shared, client: &reqwest::Client) {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     match app.store.due_payments(now, 50).await {
         Ok(due) => {
             for p in due {
@@ -136,7 +136,7 @@ pub async fn watch_merchants(app: &Shared) {
             continue;
         }
         let Some(chain) = app.chains.get(&m.network) else { continue };
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let r = match chain.merchant_state(&m.merchant_object).await {
             Ok(st) => {
                 let unexpected = m

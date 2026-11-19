@@ -184,6 +184,18 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
+    /// Sets (or, with `None`, clears) a merchant's webhook address. The caller validates the URL first
+    /// (`worker::webhook_url_allowed`); returns `false` when no merchant has that id. Pending deliveries read the
+    /// address when they are sent, so they go to the new one.
+    pub async fn set_merchant_webhook(&self, id: Uuid, webhook_url: Option<&str>) -> Result<bool, DbError> {
+        let r = sqlx::query("UPDATE cp.merchants SET webhook_url = $2 WHERE id = $1")
+            .bind(id)
+            .bind(webhook_url)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
     pub async fn merchant_by_key(&self, api_key: &str) -> Result<Option<Merchant>, DbError> {
         let r = sqlx::query(
             "SELECT id, name, webhook_url, methods, disabled FROM cp.merchants WHERE api_key_hash = $1 AND NOT disabled",
@@ -839,6 +851,21 @@ mod tests {
         assert!(s.merchant_by_key("key-1").await.unwrap().is_none());
         sqlx::query("UPDATE cp.merchants SET disabled = true").execute(s.pool()).await.unwrap();
         assert!(s.merchant_by_key("key-2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_merchants_webhook_address_can_be_changed_and_cleared() {
+        let Some(s) = store().await else { return };
+        let (m, _, _) = fixture(&s).await;
+        let to = "http://link-in-bio-api.hosting.svc.cluster.local:8081/internal/v1/payments";
+        assert!(s.set_merchant_webhook(m, Some(to)).await.unwrap());
+        assert_eq!(s.merchant(m).await.unwrap().unwrap().webhook_url.as_deref(), Some(to));
+        assert!(s.set_merchant_webhook(m, None).await.unwrap());
+        assert_eq!(s.merchant(m).await.unwrap().unwrap().webhook_url, None);
+        // An unknown merchant changes nothing and says so.
+        assert!(!s.set_merchant_webhook(Uuid::new_v4(), Some(to)).await.unwrap());
+        // The table's own rule still refuses a plain-http address outside the cluster.
+        assert!(s.set_merchant_webhook(m, Some("http://example.org/hook")).await.is_err());
     }
 
     /// A second quote of the fixture's session (what anyone who knows the session id can ask for).

@@ -5,6 +5,7 @@
 //! - `worker`: settles pending payments, expires sessions, delivers webhooks (single writer);
 //! - `migrate`: applies the schema (the owner role);
 //! - `merchant add`: creates a merchant and writes its API key to a file (never printed);
+//! - `merchant set-webhook`: changes or removes a merchant's webhook address (`merchant rotate-key` replaces its key);
 //! - `keygen`: writes a new ed25519 seed to a file and prints only the public key.
 
 use std::io::Write;
@@ -85,6 +86,29 @@ enum MerchantAction {
         #[arg(long)]
         key_out: PathBuf,
     },
+    /// Change a merchant's webhook address (--webhook-url), or remove it (--clear). Deliveries still pending go to
+    /// the new address: the worker reads it when it sends.
+    SetWebhook {
+        #[arg(long)]
+        id: uuid::Uuid,
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+        webhook_url: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+/// What `merchant add --key-file` says when the merchant already exists: nothing is changed, but a webhook address
+/// that differs from the one given is named, so a stale address is noticed instead of silently kept (FU-0156).
+fn webhook_difference(stored: Option<&str>, given: Option<&str>) -> Option<String> {
+    if given.is_none() || stored == given {
+        return None;
+    }
+    Some(format!(
+        "its webhook address is {} but {} was given; change it with `merchant set-webhook`",
+        stored.unwrap_or("(none)"),
+        given.unwrap_or("(none)")
+    ))
 }
 
 fn write_secret(path: &PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
@@ -170,6 +194,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     }
                     if let Some(m) = store.merchant_by_key(&key).await? {
                         println!("merchant {} already has this key; nothing changed", m.id);
+                        if let Some(note) = webhook_difference(m.webhook_url.as_deref(), webhook_url.as_deref()) {
+                            println!("note: {note}");
+                        }
                         return Ok(());
                     }
                     key
@@ -190,6 +217,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("no merchant {id}");
             }
             println!("new API key for {id} written to {}", key_out.display());
+            Ok(())
+        }
+        Command::Merchant { action: MerchantAction::SetWebhook { id, webhook_url, clear: _ } } => {
+            if let Some(u) = &webhook_url
+                && !worker::webhook_url_allowed(u)
+            {
+                anyhow::bail!("the webhook URL must be https (or http to an in-cluster .svc host)");
+            }
+            if !store(1)?.set_merchant_webhook(id, webhook_url.as_deref()).await? {
+                anyhow::bail!("no merchant {id}");
+            }
+            match webhook_url {
+                Some(u) => println!("merchant {id}: webhook address set to {u}"),
+                None => println!("merchant {id}: webhook address removed (no webhooks are sent)"),
+            }
             Ok(())
         }
         Command::Keygen { out } => {
@@ -226,5 +268,39 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_command_line_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn set_webhook_takes_an_address_or_clear_but_not_both() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from([&["chain-payments", "merchant", "set-webhook", "--id", id], args].concat())
+        };
+        assert!(parse(&["--webhook-url", "https://example.org/hook"]).is_ok());
+        assert!(parse(&["--clear"]).is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--clear", "--webhook-url", "https://example.org/hook"]).is_err());
+    }
+
+    #[test]
+    fn add_names_a_stale_webhook_address_and_is_quiet_otherwise() {
+        let old = "http://link-in-bio-api.link-in-bio.svc:8081/internal/v1/payments";
+        let new = "http://link-in-bio-api.hosting.svc:8081/internal/v1/payments";
+        let note = webhook_difference(Some(old), Some(new)).unwrap();
+        assert!(note.contains(old) && note.contains(new) && note.contains("set-webhook"));
+        assert!(webhook_difference(None, Some(new)).unwrap().contains("(none)"));
+        assert_eq!(webhook_difference(Some(new), Some(new)), None);
+        assert_eq!(webhook_difference(Some(old), None), None);
     }
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.5 — 2026-11-19
+
+- `chain-payments merchant set-webhook --id <id> (--webhook-url <url> | --clear)` changes or removes a merchant's webhook
+  address (validated like `merchant add`; an unknown id fails). Pending deliveries go to the new address, which the worker reads at
+  each delivery. `merchant add --key-file` on an existing merchant still changes nothing, but now names a webhook address that differs
+  from the one given (FU-0156: a namespace move had left the stored address stale with no command to fix it).
+
 ## 0.0.4 — 2026-11-18
 
 - The request limit (64) is per process, as intended: it was per route, because `Router::layer` wraps each route and

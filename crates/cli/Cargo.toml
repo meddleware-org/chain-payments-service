@@ -1,3 +1,4 @@
+# The `chain-payments` binary: one executable for every role (serve, worker, migrate, merchant, keygen).
 [package]
 name = "chain-payments"
 description = "Chain Payments: the one binary (serve, worker, migrate, merchant, keygen)."
@@ -8,22 +9,33 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# The one binary every role runs.
 [[bin]]
 name = "chain-payments"
 path = "src/main.rs"
 
+# Runtime dependencies, each declared once in the workspace.
 [dependencies]
 chain-payments-core.workspace = true
+# The database layer and the connection settings.
 chain-payments-store.workspace = true
+# The routers, the settlement logic and the worker.
 chain-payments-service.workspace = true
+# Serves the routers.
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "time", "macros", "sync", "fs"] }
+# The command line.
 clap.workspace = true
+# JSON for output.
 serde_json.workspace = true
 tracing.workspace = true
+# Writes the structured logs to standard error.
 tracing-subscriber.workspace = true
+# Merchant ids on the command line.
 uuid.workspace = true
+# Error plumbing for the commands.
 anyhow.workspace = true
 
+# Use the workspace lint set (unsafe code is forbidden and missing docs are denied).
 [lints]
 workspace = true

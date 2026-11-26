@@ -7,40 +7,56 @@
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::Serialize;
 
+/// The domain prefix of the signed message; it ties a signature to this protocol and version, so it cannot be replayed as another message.
 pub const QUOTE_DOMAIN: &[u8] = b"chain-payments:quote:v1";
 /// Identifier bound (bytes) the Move package enforces for sessions, nonces and references.
 pub const MAX_ID_BYTES: usize = 64;
 
+/// The fields of a quote, in the order the Move package reads them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteFields {
     /// 32-byte object ID of the merchant, hex without `0x`.
     pub merchant_id: String,
+    /// The checkout session identifier.
     pub session: String,
     /// `type_name::with_defining_ids` form: 64 hex digits (no `0x`), `::module::Name`.
     pub coin_type: String,
+    /// The amount in the coin's smallest unit.
     pub amount: u64,
+    /// Units bought (months for a subscription).
     pub units: u64,
+    /// The period each unit buys, in milliseconds (0 for a one-off payment).
     pub period_ms: u64,
+    /// The merchant's subscription reference (empty for a one-off payment).
     pub subscription_ref: String,
+    /// When the quote stops being valid, in epoch milliseconds.
     pub expires_ms: u64,
+    /// A random value that makes each quote unique.
     pub nonce: String,
 }
 
+/// Why a quote could not be built or signed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuoteError {
+    /// The merchant id is not 32 bytes of hex.
     #[error("the merchant id is not 32 bytes of hex")]
     MerchantId,
+    /// A session, nonce or reference is empty or longer than the bound.
     #[error("an identifier is empty or longer than 64 bytes")]
     Identifier,
+    /// The coin type is not in the canonical form.
     #[error("the coin type is not in the canonical form")]
     CoinType,
+    /// The signing seed is not valid.
     #[error("the signing key is not a valid ed25519 seed")]
     Key,
 }
 
+/// Append `n` as a ULEB128 integer, the BCS length prefix.
 fn uleb(mut n: u64, out: &mut Vec<u8>) {
     loop {
+        // Seven bits at a time, least significant first.
         let b = (n & 0x7f) as u8;
         n >>= 7;
         if n == 0 {
@@ -51,6 +67,7 @@ fn uleb(mut n: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Append a byte string with its BCS length prefix.
 fn bcs_bytes(b: &[u8], out: &mut Vec<u8>) {
     uleb(b.len() as u64, out);
     out.extend_from_slice(b);
@@ -58,7 +75,9 @@ fn bcs_bytes(b: &[u8], out: &mut Vec<u8>) {
 
 /// The canonical coin type string: `0x2::sui::SUI` → `000…002::sui::SUI`.
 pub fn canonical_coin_type(t: &str) -> Result<String, QuoteError> {
+    // `<package>::<module>::<Name>`: split off the package address first.
     let (pkg, rest) = t.trim().split_once("::").ok_or(QuoteError::CoinType)?;
+    // The address in lower-case hex without `0x`, as the Move `type_name` prints it.
     let hex = pkg.trim_start_matches("0x").to_ascii_lowercase();
     if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(QuoteError::CoinType);
@@ -67,19 +86,24 @@ pub fn canonical_coin_type(t: &str) -> Result<String, QuoteError> {
     let (Some(module), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err(QuoteError::CoinType);
     };
+    // Move identifiers: letters, digits and underscores only.
     let ident = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     if !ident(module) || !ident(name) {
         return Err(QuoteError::CoinType);
     }
+    // Left-pad the address to 64 digits: the canonical form the Move package compares.
     Ok(format!("{hex:0>64}::{module}::{name}"))
 }
 
 impl QuoteFields {
+    /// The exact message the Move package verifies: the domain, the merchant id and the BCS encoding of the fields.
     pub fn message(&self) -> Result<Vec<u8>, QuoteError> {
+        // The merchant object id: 32 bytes, with or without `0x`.
         let id = hex::decode(self.merchant_id.trim_start_matches("0x")).map_err(|_| QuoteError::MerchantId)?;
         if id.len() != 32 {
             return Err(QuoteError::MerchantId);
         }
+        // A session and a nonce must be present and bounded; the Move package enforces the same bound.
         for s in [&self.session, &self.nonce] {
             if s.is_empty() || s.len() > MAX_ID_BYTES {
                 return Err(QuoteError::Identifier);
@@ -88,13 +112,16 @@ impl QuoteFields {
         if self.subscription_ref.len() > MAX_ID_BYTES {
             return Err(QuoteError::Identifier);
         }
+        // Only the canonical spelling is signed, so two spellings of one coin can never be two different quotes.
         if canonical_coin_type(&self.coin_type)? != self.coin_type {
             return Err(QuoteError::CoinType);
         }
+        // The message: the domain, then each field in the order the Move package decodes them.
         let mut m = QUOTE_DOMAIN.to_vec();
         m.extend_from_slice(&id);
         bcs_bytes(self.session.as_bytes(), &mut m);
         bcs_bytes(self.coin_type.as_bytes(), &mut m);
+        // Integers are little-endian u64, as BCS writes them.
         m.extend_from_slice(&self.amount.to_le_bytes());
         m.extend_from_slice(&self.units.to_le_bytes());
         m.extend_from_slice(&self.period_ms.to_le_bytes());
@@ -107,28 +134,34 @@ impl QuoteFields {
 
 /// An ed25519 signing key held in memory (from a 32-byte seed file on the node).
 pub struct Signer {
+    /// The ed25519 key pair.
     pair: Ed25519KeyPair,
 }
 
 impl std::fmt::Debug for Signer {
+    /// Show the public key only: a signer is never printed with its seed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Signer(public {})", self.public_hex())
     }
 }
 
 impl Signer {
+    /// Build a signer from a 32-byte seed.
     pub fn from_seed(seed: &[u8]) -> Result<Self, QuoteError> {
         Ed25519KeyPair::from_seed_unchecked(seed).map(|pair| Self { pair }).map_err(|_| QuoteError::Key)
     }
 
+    /// The public key as hex, for the merchants to verify with.
     pub fn public_hex(&self) -> String {
         hex::encode(self.pair.public_key().as_ref())
     }
 
+    /// Sign a message and return the 64-byte signature.
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
         self.pair.sign(msg).as_ref().to_vec()
     }
 
+    /// Sign a quote and return the signature as base64.
     pub fn sign_quote(&self, q: &QuoteFields) -> Result<String, QuoteError> {
         Ok(hex::encode(self.sign(&q.message()?)))
     }
@@ -139,11 +172,13 @@ pub fn verify(public: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     UnparsedPublicKey::new(&ED25519, public).verify(msg, sig).is_ok()
 }
 
+/// Unit tests for this module.
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
 
+    /// Matches the move package vectors.
     #[test]
     fn matches_the_move_package_vectors() {
         let v: Value = serde_json::from_str(include_str!("../../../fixtures/quote-vectors.json")).unwrap();
@@ -166,6 +201,7 @@ mod tests {
         }
     }
 
+    /// Every shared negative vector is refused.
     #[test]
     fn every_shared_negative_vector_is_refused() {
         // The Move repo's negative vectors (a valid signature with one field changed, or truncated): this side builds
@@ -193,6 +229,7 @@ mod tests {
         }
     }
 
+    /// Canonical coin types.
     #[test]
     fn canonical_coin_types() {
         assert_eq!(

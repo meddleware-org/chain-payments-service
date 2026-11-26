@@ -1,7 +1,9 @@
+# The workspace: five crates sharing one version, edition and lint set. The release profile favours safety (overflow checks, abort on panic) over a few percent of speed.
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/chain-sui", "crates/store", "crates/service", "crates/cli"]
 
+# Fields every crate inherits, so one edit bumps the version of all.
 [workspace.package]
 version = "0.0.5"
 edition = "2024"
@@ -12,46 +14,72 @@ publish = false
 
 # Exact pins, as in the rest of the fleet.
 [workspace.dependencies]
+# The workspace crates, by path.
 chain-payments-core = { path = "crates/core" }
 chain-payments-chain-sui = { path = "crates/chain-sui" }
 chain-payments-store = { path = "crates/store" }
 chain-payments-service = { path = "crates/service" }
 
+# The platform's shared gRPC-web client and protobuf reader (one implementation for the whole platform).
 access-gate-gateway-core = "=0.0.33"
+# PostgreSQL with rustls (ring) for TLS; runtime-checked queries and embedded migrations.
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
+# The HTTP server and routing.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tower-log"] }
+# Concurrency limit, timeout and utilities for the routers.
 tower = { version = "=0.5.3", default-features = false, features = ["util", "limit", "timeout"] }
 tower-http = { version = "=0.7.1", default-features = false, features = ["timeout", "limit"] }
+# The async runtime; each crate enables the features it needs.
 tokio = { version = "=1.54.1", default-features = false }
+# The command line of the single binary.
 clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+# Serialisation of the API bodies and the stored JSON.
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+# Error types for libraries; `anyhow` is for the binaries and the glue.
 thiserror = "=2.0.21"
 anyhow = "=1.0.104"
+# Structured logs.
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
+# URL parsing (webhook targets, database URLs).
 url = "=2.5.8"
+# Timestamps stored in the database and printed in RFC 3339.
 time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing"] }
+# Random identifiers for merchants and webhooks.
 uuid = { version = "=1.29.0", default-features = false, features = ["std", "v4", "serde"] }
+# Base64 for signatures and event fields.
 base64 = "=0.23.1"
 hex = "=0.4.3"
+# SHA-256 of API keys.
 sha2 = "=0.11.1"
+# ed25519 signing and the system random source.
 ring = "=0.17.14"
+# TLS, with the ring provider only.
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+# The HTTP client for price sources, webhooks and the full nodes.
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
+# Property tests of the money arithmetic.
 proptest = "=1.12.0"
 
+# The lint set every crate inherits: no unsafe code, and every item documented.
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# Every item has a doc comment, private ones and fields included (the workspace documentation standard, D144).
+missing_docs = "deny"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+missing_docs_in_private_items = "deny"
 
+# The shipped binaries are built with these settings.
 [profile.release]
 overflow-checks = true
 panic = "abort"
+# Link-time optimisation and one codegen unit shrink and speed the binary.
 lto = true
 codegen-units = 1
+# Strip symbols: the image carries no debug information.
 strip = true

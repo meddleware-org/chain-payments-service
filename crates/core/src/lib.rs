@@ -7,9 +7,15 @@
 //! - [`session`]: checkout sessions as merchants create them;
 //! - [`registry`]: the payment methods an instance offers.
 
+/// Money and prices in fixed point.
 pub mod money;
+/// Combining price sources into one agreed price.
 pub mod price;
+/// The quote message and ed25519 signing.
 pub mod quote;
+/// The payment methods an instance offers.
 pub mod registry;
+/// Checkout sessions as merchants create them.
 pub mod session;
+/// Webhook signatures.
 pub mod webhook;

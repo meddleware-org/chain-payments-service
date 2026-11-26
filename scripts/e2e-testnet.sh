@@ -20,11 +20,14 @@ MERCHANT=0xd92a3ce208124219667d5b17a939617cc4dc816c093b91fd80f1f164e635d5e5
 CONFIG=0x7e3b9a5c5346850d0703df88fcab044644c3e92b84a65e59b4661ef0e7b96106
 
 work="$(mktemp -d)"
+# cleanup: stop the server and delete the work directory (runs on every exit path).
 cleanup() { [[ -n "${srv:-}" ]] && kill "$srv" 2> /dev/null; rm -rf "$work"; }
 trap cleanup EXIT
 python3 -c 'import sys; sys.stdout.buffer.write(bytes([1]) * 32)' > "$work/quote.key"
 cargo build -q -p chain-payments
+# The debug build is enough: this script tests behaviour on testnet, not speed.
 bin=target/debug/chain-payments
+# A fresh webhook key per run; only its public half is ever shown.
 "$bin" keygen --out "$work/webhook.key" > /dev/null
 cat > "$work/methods.json" <<JSON
 {"methods":[{"id":"sui-testnet:SUI","chain":"sui","network":"testnet","coinType":"0x2::sui::SUI","symbol":"SUI","decimals":9,
@@ -37,6 +40,7 @@ export METHODS_FILE="$work/methods.json" QUOTE_KEY_FILE="$work/quote.key" WEBHOO
 export SUI_GRPC_TESTNET=https://fullnode.testnet.sui.io:443 ALLOWED_ORIGINS=http://127.0.0.1:4300
 export PUBLIC_LISTEN_ADDR=127.0.0.1:18080 INTERNAL_LISTEN_ADDR=127.0.0.1:18081
 "$bin" merchant add --name "e2e $(date +%s)" --methods sui-testnet:SUI --key-out "$work/api.key" > /dev/null
+# The server runs in the background and its log is kept for a failed run.
 "$bin" serve > "$work/serve.log" 2>&1 &
 srv=$!
 for _ in $(seq 1 40); do curl -fs http://127.0.0.1:18080/healthz > /dev/null && break; sleep 0.25; done
@@ -45,6 +49,7 @@ key="$(cat "$work/api.key")"
 session="$(curl -fsS -X POST http://127.0.0.1:18081/v1/merchant/sessions -H "authorization: Bearer $key" -H 'content-type: application/json' \
   -d '{"amountPence":1,"description":"e2e one penny","subscriptionRef":"e2e-acct","periodMs":2629800000,"metadata":{"test":true}}' | jq -r .id)"
 echo "session $session"
+# Ask for a priced quote: the live price sources are used.
 quote="$(curl -fsS -X POST "http://127.0.0.1:18080/v1/sessions/$session/quotes" -H 'content-type: application/json' -d '{"method":"sui-testnet:SUI"}')"
 echo "quote: $(jq -r .amountText <<< "$quote") for $(jq -r .priceText <<< "$quote")"
 args="$(python3 -c '
@@ -53,10 +58,12 @@ q = json.load(sys.stdin)
 vec = lambda b: "vector[" + ",".join(str(x) for x in b) + "]"
 print("\n".join([vec(q["session"].encode()), q["amount"], str(q["units"]), q["periodMs"], vec(q["subscriptionRef"].encode()),
                  q["expiresMs"], vec(q["nonce"].encode()), vec(bytes.fromhex(q["signature"]))]))' <<< "$quote")"
+# The quote fields, one per line, in the order the Move `pay` function takes them.
 mapfile -t a <<< "$args"
 pay_amount=$(( ${a[1]} + 1000 ))
 out="$(sui client ptb --gas-budget 50000000 --json --split-coins gas "[$pay_amount]" --assign c \
   --move-call "$PKG::chain_payments::pay" "<0x2::sui::SUI>" "@$CONFIG" "@$MERCHANT" "${a[0]}" "${a[1]}" "${a[2]}" "${a[3]}" "${a[4]}" "${a[5]}" "${a[6]}" "${a[7]}" c.0 @0x6)"
+# The transaction digest is what the checkout would submit.
 digest="$(jq -r .digest <<< "$out")"
 echo "paid: $digest"
 # The split: the quoted amount minus 0.2 % (rounded down) to the merchant's recipient, the rest to the treasury.

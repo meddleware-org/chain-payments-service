@@ -64,3 +64,10 @@ chain-payments worker   # same environment; serves /metrics and /healthz on WORK
 
 Image: `quay.io/meddleware-org/chain-payments-service` (multi-arch, cosign-signed by this repository's
 `docker-publish.yml`, with SBOMs and provenance). Licence: [0BSD](LICENSE).
+
+## Development
+
+The tests run against a real PostgreSQL with TLS (`scripts/test-postgres.sh` starts a throwaway one; `DOCKER=podman` works rootless).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the commands and the rules. Every item has a doc comment (`missing_docs` and
+`clippy::missing_docs_in_private_items` are denied in the workspace lints). Migrations are never edited once released: sqlx
+checksums each applied file, comments included.

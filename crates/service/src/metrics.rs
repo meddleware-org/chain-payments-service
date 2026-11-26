@@ -3,29 +3,44 @@
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The process counters. Each process counts only what it does (the API counts quotes, the worker counts confirmations), so they are summed across processes.
 #[derive(Debug, Default)]
 pub struct Metrics {
+    /// Quotes signed.
     pub quotes: AtomicU64,
+    /// Quote requests that ended without a quote.
     pub quote_failures: AtomicU64,
+    /// Claims submitted by a checkout.
     pub payments_submitted: AtomicU64,
+    /// Payments confirmed on chain.
     pub payments_confirmed: AtomicU64,
+    /// Claims rejected for good.
     pub payments_rejected: AtomicU64,
+    /// Payments for a session that was no longer open.
     pub payments_unapplied: AtomicU64,
+    /// Payments found through events that no checkout submitted.
     pub payments_found: AtomicU64,
+    /// Webhooks delivered.
     pub webhooks_delivered: AtomicU64,
+    /// Webhook attempts that failed.
     pub webhook_failures: AtomicU64,
+    /// Price lookups that gave no agreed price.
     pub price_failures: AtomicU64,
+    /// Sessions created.
     pub sessions_created: AtomicU64,
 }
 
 impl Metrics {
+    /// Add one to a counter; relaxed ordering is enough because a counter orders nothing.
     pub fn inc(c: &AtomicU64) {
+        // A relaxed add: the value is only ever read for display.
         c.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The merchant watch as gauges (one series per merchant object).
     pub fn render_watch(rows: &[(String, bool, bool, bool, i64)]) -> String {
         let mut s = String::new();
+        // The four gauges, each with the column of the watch row it reads.
         for (name, help, pick) in [
             ("chain_payments_merchant_pending_recipient", "1 while a recipient change is pending on-chain", 0usize),
             (
@@ -36,8 +51,11 @@ impl Metrics {
             ("chain_payments_merchant_quote_key_foreign", "1 when the on-chain quote key is not this service's", 2),
             ("chain_payments_merchant_watch_age_seconds", "Seconds since the worker last read the merchant", 3),
         ] {
+            // Writing to a String cannot fail, so the result is ignored.
             let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge");
+            // One series per merchant object, labelled with its on-chain id.
             for (m, pending, unexpected, foreign, age) in rows {
+                // `pick` selects which column of the row this gauge shows.
                 let v = match pick {
                     0 => *pending as i64,
                     1 => *unexpected as i64,
@@ -50,8 +68,10 @@ impl Metrics {
         s
     }
 
+    /// The counters and the backlog as Prometheus text.
     pub fn render(&self, backlog: Option<(i64, i64, i64)>) -> String {
         let mut s = String::new();
+        // Counter name, help text and the counter, in the order they are printed.
         let counters = [
             ("chain_payments_quotes_total", "Quotes signed", &self.quotes),
             ("chain_payments_quote_failures_total", "Quote requests that got no quote", &self.quote_failures),
@@ -80,6 +100,7 @@ impl Metrics {
         for (name, help, c) in counters {
             let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} counter\n{name} {}", c.load(Ordering::Relaxed));
         }
+        // The backlog gauges are read from the database; they are omitted when it cannot be read.
         if let Some((open, pending, undelivered)) = backlog {
             for (name, help, v) in [
                 ("chain_payments_sessions_open", "Open checkout sessions", open),

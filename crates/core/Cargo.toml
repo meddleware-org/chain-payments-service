@@ -1,3 +1,4 @@
+# The pure core: money, prices, quotes, sessions, the method registry and webhook signatures. No I/O, so it is tested without a database or a network.
 [package]
 name = "chain-payments-core"
 description = "Chain Payments: money and price arithmetic, quotes (message, signing), webhooks, sessions and the coin registry. Pure: no I/O."
@@ -8,16 +9,22 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# Runtime dependencies, each declared once in the workspace.
 [dependencies]
+# Session requests and the registry are read from JSON.
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# ed25519 signing and the system random source.
 ring.workspace = true
 base64.workspace = true
+# Hex for identifiers and public keys.
 hex.workspace = true
 
+# Used by the tests only.
 [dev-dependencies]
 proptest.workspace = true
 
+# Use the workspace lint set (unsafe code is forbidden and missing docs are denied).
 [lints]
 workspace = true

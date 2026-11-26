@@ -1,3 +1,4 @@
+# The service: the public and merchant APIs, the price sources, the settlement logic and the worker duties.
 [package]
 name = "chain-payments-service"
 description = "Chain Payments: the public session API, the merchant API, price sources, the watcher and webhook delivery."
@@ -8,33 +9,46 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# Runtime dependencies, each declared once in the workspace.
 [dependencies]
+# The pure core: money, quotes, sessions, signatures.
 chain-payments-core.workspace = true
+# Payment verification on Sui.
 chain-payments-chain-sui.workspace = true
+# Every SQL statement.
 chain-payments-store.workspace = true
+# The platform's shared gRPC-web types.
 access-gate-gateway-core.workspace = true
+# The routers.
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros"] }
+# Price sources and webhook delivery.
 reqwest.workspace = true
 rustls.workspace = true
+# API bodies.
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Error plumbing in the glue code.
 anyhow.workspace = true
 tracing.workspace = true
+# Timestamps in answers and webhooks.
 time.workspace = true
 uuid.workspace = true
 url.workspace = true
 hex.workspace = true
 
+# Used by the tests only: a real database, hand-built requests.
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Read a response body in the API tests.
 http-body-util = "=0.1.5"
 base64.workspace = true
 sqlx.workspace = true
 chain-payments-store.workspace = true
 
+# Use the workspace lint set (unsafe code is forbidden and missing docs are denied).
 [lints]
 workspace = true

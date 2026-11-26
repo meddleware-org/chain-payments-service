@@ -13,12 +13,15 @@ use crate::metrics::Metrics;
 /// Webhook attempts before a delivery is left for a person (it stays in the outbox, visible in metrics).
 pub const MAX_WEBHOOK_ATTEMPTS: i32 = 20;
 
+/// The client webhooks are sent with: no redirects (a merchant cannot bounce a delivery elsewhere), no proxy, short timeouts.
 pub fn webhook_client() -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Ok(reqwest::Client::builder()
+        // Merchants can recognise the service in their logs.
         .user_agent(concat!("chain-payments/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
+        // A merchant endpoint that does not answer cannot hold a worker.
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()?)
@@ -26,23 +29,30 @@ pub fn webhook_client() -> anyhow::Result<reqwest::Client> {
 
 /// Webhook targets: `https://` anywhere, or plain `http://` only to an in-cluster Service (`*.svc` / `*.svc.cluster.local`).
 pub fn webhook_url_allowed(url: &str) -> bool {
+    // An address that does not parse is not allowed.
     let Ok(u) = url::Url::parse(url) else { return false };
+    // Credentials in a webhook URL are refused: the signature is the authentication, and a URL with a password would be logged.
     if !u.username().is_empty() || u.password().is_some() {
         return false;
     }
     match (u.scheme(), u.host_str()) {
+        // HTTPS to any host.
         ("https", Some(_)) => true,
+        // Plain http only to an in-cluster Service, whose traffic never leaves the cluster.
         ("http", Some(h)) => h.ends_with(".svc") || h.ends_with(".svc.cluster.local"),
         _ => false,
     }
 }
 
+/// Send one webhook: look up the merchant address now, sign `<unix>.<body>`, post it, and record the outcome; a failure keeps only a class, never the address.
 async fn deliver(app: &Shared, client: &reqwest::Client, w: &Webhook) {
     let now = OffsetDateTime::now_utc();
+    // The address is read when sending, so a change takes effect for deliveries still pending.
     let url = match app.store.merchant(w.merchant_id).await {
         Ok(Some(m)) => m.webhook_url,
         _ => None,
     };
+    // A merchant without an acceptable address is polled instead; nothing is retried.
     let Some(url) = url.filter(|u| webhook_url_allowed(u)) else {
         // No endpoint: the merchant polls instead; nothing to retry.
         let _ = app.store.webhook_delivered(w.id, now).await;
@@ -50,34 +60,43 @@ async fn deliver(app: &Shared, client: &reqwest::Client, w: &Webhook) {
     };
     let body =
         serde_json::to_vec(&serde_json::json!({ "id": w.id, "event": w.event, "data": w.payload })).unwrap_or_default();
+    // Only a process that holds the webhook key delivers; the API leaves the rows for the worker.
     let Some(signer) = app.config.webhook_signer.as_ref() else {
         tracing::error!("this process does not hold the webhook key; webhooks are left for the worker");
         return;
     };
+    // The signature covers the timestamp and the exact body that is sent.
     let sig = webhook::sign(signer, now.unix_timestamp() as u64, &body);
     let r = client
         .post(&url)
         .header("content-type", "application/json")
         .header(webhook::HEADER, sig)
+        // The event id lets a merchant ignore a repeat: delivery is at least once.
         .header("chain-payments-event-id", w.id.to_string())
         .body(body)
         .send()
         .await;
     match r {
+        // Any 2xx counts as delivered.
         Ok(resp) if resp.status().is_success() => {
             let _ = app.store.webhook_delivered(w.id, now).await;
             Metrics::inc(&app.metrics.webhooks_delivered);
         }
         other => {
+            // Count each failed attempt.
             Metrics::inc(&app.metrics.webhook_failures);
             let reason = match other {
                 Ok(resp) => format!("HTTP {}", resp.status()),
+                // The reason keeps the class (timeout or connection) and nothing of the address.
                 Err(e) => format!("not delivered: {}", if e.is_timeout() { "timeout" } else { "connection failed" }),
             };
+            // After the last attempt the delivery stays in the outbox, visible in metrics, for a person.
             if w.attempts >= MAX_WEBHOOK_ATTEMPTS {
+                // Logged at error: a person must look at it.
                 tracing::error!(id = %w.id, %reason, "webhook gave up; left in the outbox");
                 let _ = app.store.webhook_failed(w.id, &reason, now + time::Duration::days(3650)).await;
             } else {
+                // Doubling backoff from ten seconds, capped at six hours.
                 let backoff = (10i64 * 2i64.saturating_pow(w.attempts.clamp(0, 12) as u32)).min(6 * 3600);
                 let _ = app.store.webhook_failed(w.id, &reason, now + time::Duration::seconds(backoff)).await;
             }
@@ -91,6 +110,7 @@ fn graphql_client() -> anyhow::Result<reqwest::Client> {
         .user_agent(concat!("chain-payments/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
+        // The GraphQL read is bounded.
         .timeout(Duration::from_secs(15))
         .build()?)
 }
@@ -98,19 +118,24 @@ fn graphql_client() -> anyhow::Result<reqwest::Client> {
 /// One pass of every duty (also what the tests call).
 pub async fn tick(app: &Shared, client: &reqwest::Client) {
     let now = OffsetDateTime::now_utc();
+    // Pending claims due for a check, oldest first.
     match app.store.due_payments(now, 50).await {
         Ok(due) => {
             for p in due {
+                // A claim that cannot be settled this time is logged and left for the next pass.
                 if let Err(e) = app.settle(&p.digest, &p.nonce).await {
                     tracing::warn!(digest = %p.digest, error = %e, "settle");
                 }
             }
         }
+        // A database failure ends this pass only.
         Err(e) => tracing::error!(error = %e, "due payments"),
     }
+    // Sessions past their time are expired and their webhooks queued.
     if let Err(e) = app.store.expire_sessions(now).await {
         tracing::error!(error = %e, "expire sessions");
     }
+    // Up to twenty webhooks are claimed with a 60 second lease, so a crash retries later.
     match app.store.claim_webhooks(now, 20, 60).await {
         Ok(hooks) => {
             for w in &hooks {
@@ -135,6 +160,7 @@ pub async fn watch_merchants(app: &Shared) {
         if !seen.insert(m.merchant_object.clone()) {
             continue;
         }
+        // A network with no client is skipped; the configuration check catches it earlier.
         let Some(chain) = app.chains.get(&m.network) else { continue };
         let now = OffsetDateTime::now_utc();
         let r = match chain.merchant_state(&m.merchant_object).await {
@@ -143,7 +169,9 @@ pub async fn watch_merchants(app: &Shared) {
                     .recipient
                     .as_deref()
                     .is_some_and(|want| chain_payments_chain_sui::normalize(want) != st.recipient);
+                // The merchant's on-chain quote key must be this service's.
                 let foreign = st.quote_key != app.config.quote_public;
+                // Any change is logged at error: it stops quoting for the merchant until a person checks.
                 if unexpected || foreign || st.pending_recipient.is_some() {
                     tracing::error!(merchant = %m.merchant_object, ?st, unexpected, foreign, "merchant changed on-chain");
                 }
@@ -162,6 +190,7 @@ pub async fn watch_merchants(app: &Shared) {
             }
             Err(e) => {
                 tracing::error!(merchant = %m.merchant_object, error = %e, "merchant unreadable");
+                // An unreadable merchant is recorded as unexpected: an unknown state is not a known-good one.
                 app.store.record_merchant_watch(&m.merchant_object, "?", None, "?", false, true, false, now).await
             }
         };
@@ -176,6 +205,7 @@ pub async fn watch_merchants(app: &Shared) {
 pub async fn reconcile(app: &Shared, client: &reqwest::Client) {
     let mut seen = std::collections::BTreeSet::new();
     for m in &app.config.registry.methods {
+        // Methods share packages; each package is read once per pass.
         if !seen.insert(m.package_id.clone()) {
             continue;
         }
@@ -193,19 +223,24 @@ pub async fn reconcile_package(
     url: &str,
     package_id: &str,
 ) -> anyhow::Result<()> {
+    // Continue where the last pass stopped.
     let mut cursor = app.store.event_cursor(package_id).await?;
+    // A few pages per pass, so one busy package cannot starve the other duties.
     for _ in 0..EVENT_PAGES_PER_PASS {
         let page = chain_payments_chain_sui::paid_events(client, url, package_id, cursor.as_deref()).await?;
         for e in &page.events {
+            // Only an event naming one of our quotes becomes a claim, and only once.
             if app.store.claim_found_payment(&e.digest, &e.nonce).await? {
                 Metrics::inc(&app.metrics.payments_found);
                 tracing::info!(digest = %e.digest, "found a payment no checkout submitted");
             }
         }
+        // The cursor moves forward after each page, so a failure re-reads at most one page.
         if let Some(c) = &page.end_cursor {
             app.store.set_event_cursor(package_id, c).await?;
             cursor = Some(c.clone());
         }
+        // The last page: stop.
         if !page.has_next {
             break;
         }
@@ -215,11 +250,14 @@ pub async fn reconcile_package(
 
 /// Runs until `stop` resolves, holding the single-writer lock.
 pub async fn run(app: Shared, stop: impl std::future::Future<Output = ()>) -> anyhow::Result<()> {
+    // The webhook client and the GraphQL client are separate: only the first sends signed bodies.
     let client = webhook_client()?;
     tokio::pin!(stop);
+    // Only one worker runs duties at a time: wait for the advisory lock, retrying.
     let _lock = loop {
         match app.store.try_watcher_lock().await {
             Ok(Some(c)) => break c,
+            // Another worker is running: wait quietly.
             Ok(None) => tracing::info!("another worker holds the lock; waiting"),
             Err(e) => tracing::warn!(error = %e, "cannot take the lock yet"),
         }
@@ -230,11 +268,15 @@ pub async fn run(app: Shared, stop: impl std::future::Future<Output = ()>) -> an
     };
     tracing::info!("worker running");
     let chain_client = graphql_client()?;
+    // When the slower duties last ran.
     let mut last_slow: Option<std::time::Instant> = None;
     loop {
+        // The fast duties run every iteration.
         tick(&app, &client).await;
         if last_slow.is_none_or(|t| t.elapsed() >= SLOW_DUTY_EVERY) {
+            // Read each merchant object on chain.
             watch_merchants(&app).await;
+            // Find payments no checkout submitted.
             reconcile(&app, &chain_client).await;
             last_slow = Some(std::time::Instant::now());
         }
@@ -245,8 +287,10 @@ pub async fn run(app: Shared, stop: impl std::future::Future<Output = ()>) -> an
     }
 }
 
+/// Unit tests for this module.
 #[cfg(test)]
 mod tests {
+    /// Webhook targets.
     #[test]
     fn webhook_targets() {
         assert!(super::webhook_url_allowed("https://example.org/hook"));

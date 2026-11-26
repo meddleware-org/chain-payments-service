@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- A request error from a full node or the GraphQL endpoint no longer names the URL it was sent to (the URL can carry a credential), and
+  `merchant add` and `merchant set-webhook` name a webhook address by its origin only, never its path or query. A rejected `ALLOWED_ORIGINS`
+  entry is no longer repeated in the start-up error.
+- Two unused dependencies removed (`chain-payments-core` from the store and the Sui crates).
+- `missing_docs` and `clippy::missing_docs_in_private_items` are denied in the workspace lints; every item, field and variant has a doc comment, and the
+  sources, scripts and workflows carry line-level comments. `CONTRIBUTING.md` added. No other behaviour change.
+
 ## 0.0.5 — 2026-11-19
 
 - `chain-payments merchant set-webhook --id <id> (--webhook-url <url> | --clear)` changes or removes a merchant's webhook

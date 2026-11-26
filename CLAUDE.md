@@ -37,6 +37,13 @@ bash scripts/e2e-testnet.sh                                             # a real
 docker build -t chain-payments-service:dev . && bash scripts/smoke.sh chain-payments-service:dev
 ```
 
+## Documentation and configuration rules
+
+- `missing_docs` and `clippy::missing_docs_in_private_items` are `deny` in `[workspace.lints]`: every item, field and variant has a `///` comment.
+- Migrations in `crates/store/migrations/` are never edited, not even a comment: sqlx checksums each applied file and refuses to start when it changes.
+- A URL is never repeated whole in a message, a log or a stored error (it can carry a credential): `chain_payments_store::config::describe_url` names its origin,
+  and `reqwest` errors go through `without_url`. The webhook addresses and the full-node URLs are the ones that matter here.
+
 ## Adding a chain
 
 A crate `crates/chain-<name>` with `verify_payment(digest, expected)`, a `chain` value in `registry.rs`, the on-chain

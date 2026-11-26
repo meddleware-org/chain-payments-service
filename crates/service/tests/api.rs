@@ -14,8 +14,10 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+/// A merchant API key for the test merchant.
 const KEY: &str = "cpk_0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// An app over a fresh database, with its full node at an address nobody serves; `None` when no test database is configured.
 async fn app() -> Option<Arc<App>> {
     app_with("https://fullnode.testnet.sui.io:443").await
 }
@@ -29,6 +31,7 @@ async fn app_with(grpc: &str) -> Option<Arc<App>> {
         return None;
     };
     let admin = DatabaseSettings::parse(&url, false).unwrap().lazy_pool(2, Access::ReadWrite).unwrap();
+    // A fresh database per test.
     let name = format!("cp_api_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();
     let pool = DatabaseSettings::parse(&url.replacen("/postgres?", &format!("/{name}?"), 1), false)
@@ -40,6 +43,7 @@ async fn app_with(grpc: &str) -> Option<Arc<App>> {
     store.create_merchant("Test", KEY, None, &["sui-testnet:GBPT".into()]).await.unwrap();
     let dir = std::env::temp_dir().join(format!("cp-api-{name}"));
     std::fs::create_dir_all(&dir).unwrap();
+    // Throwaway test seeds: never a real key.
     std::fs::write(dir.join("q.key"), [1u8; 32]).unwrap();
     std::fs::write(dir.join("w.key"), [2u8; 32]).unwrap();
     std::fs::write(
@@ -49,6 +53,7 @@ async fn app_with(grpc: &str) -> Option<Arc<App>> {
         .to_string(),
     )
     .unwrap();
+    // A fake environment: the same settings production reads from variables.
     let env = |k: &str| -> Option<String> {
         match k {
             "METHODS_FILE" => Some(dir.join("methods.json").display().to_string()),
@@ -56,6 +61,7 @@ async fn app_with(grpc: &str) -> Option<Arc<App>> {
             "WEBHOOK_KEY_FILE" => Some(dir.join("w.key").display().to_string()),
             "SUI_GRPC_TESTNET" => Some(grpc.clone()),
             "ALLOWED_ORIGINS" => Some("https://app.example.org".into()),
+            // A low cap, so the test can reach it.
             "MAX_QUOTES_PER_SESSION" => Some("2".into()),
             _ => None,
         }
@@ -63,6 +69,7 @@ async fn app_with(grpc: &str) -> Option<Arc<App>> {
     Some(Arc::new(App::new(store, Config::from_env(env).unwrap()).unwrap()))
 }
 
+/// Run one request through a router and return the status, headers and JSON body.
 async fn call(router: axum::Router, req: Request<Body>) -> (StatusCode, axum::http::HeaderMap, Value) {
     let r = router.oneshot(req).await.unwrap();
     let (parts, body) = r.into_parts();
@@ -70,6 +77,7 @@ async fn call(router: axum::Router, req: Request<Body>) -> (StatusCode, axum::ht
     (parts.status, parts.headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+/// A JSON POST, with a bearer key when one is given.
 fn post(uri: &str, body: Value, key: Option<&str>) -> Request<Body> {
     let mut b = Request::post(uri).header(header::CONTENT_TYPE, "application/json");
     if let Some(k) = key {
@@ -78,6 +86,7 @@ fn post(uri: &str, body: Value, key: Option<&str>) -> Request<Body> {
     b.body(Body::from(body.to_string())).unwrap()
 }
 
+/// Merchant api needs a key and validates.
 #[tokio::test]
 async fn merchant_api_needs_a_key_and_validates() {
     let Some(app) = app().await else { return };
@@ -96,6 +105,7 @@ async fn merchant_api_needs_a_key_and_validates() {
     assert_eq!(v["methods"][0], "sui-testnet:GBPT");
 }
 
+/// A checkout reads its session and gets exact quotes.
 #[tokio::test]
 async fn a_checkout_reads_its_session_and_gets_exact_quotes() {
     let Some(app) = app().await else { return };
@@ -147,6 +157,7 @@ async fn a_checkout_reads_its_session_and_gets_exact_quotes() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// Cors only for configured origins and no cookies.
 #[tokio::test]
 async fn cors_only_for_configured_origins_and_no_cookies() {
     let Some(app) = app().await else { return };
@@ -164,6 +175,7 @@ async fn cors_only_for_configured_origins_and_no_cookies() {
     assert_eq!(h[header::CACHE_CONTROL], "no-store");
 }
 
+/// Unverifiable claims are capped per session.
 #[tokio::test]
 async fn unverifiable_claims_are_capped_per_session() {
     // Nothing answers at 127.0.0.1:9, so every claim stays pending (an outage is retried, never decided).
@@ -177,6 +189,7 @@ async fn unverifiable_claims_are_capped_per_session() {
         call(p.clone(), post(&format!("/v1/sessions/{id}/quotes"), json!({"method": "sui-testnet:GBPT"}), None)).await;
     let nonce = q["nonce"].as_str().unwrap().to_string();
     // Well-formed digests (43 base58 characters) that no transaction has.
+    /// The base58 alphabet, to build a well-formed transaction digest.
     const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let digest = |i: u8| String::from_utf8(vec![B58[i as usize % B58.len()]; 43]).unwrap();
     let claim =
@@ -193,6 +206,7 @@ async fn unverifiable_claims_are_capped_per_session() {
     assert_eq!(st, StatusCode::OK);
 }
 
+/// A merchant changed on chain gets no quotes.
 #[tokio::test]
 async fn a_merchant_changed_on_chain_gets_no_quotes() {
     let Some(app) = app().await else { return };
@@ -231,6 +245,7 @@ async fn a_merchant_changed_on_chain_gets_no_quotes() {
     assert!(text.contains("chain_payments_merchant_pending_recipient{merchant=\"0x30b6\"} 0"), "{text}");
 }
 
+/// A payment no checkout submitted is found from its event.
 #[tokio::test]
 async fn a_payment_no_checkout_submitted_is_found_from_its_event() {
     let Some(app) = app().await else { return };

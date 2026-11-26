@@ -43,6 +43,7 @@ on:
         default: true
 
 env:
+  # No tool in the pipeline may send telemetry.
   DO_NOT_TRACK: "1"
   IMAGE: chain-payments-service
 
@@ -50,12 +51,16 @@ permissions:
   contents: read
 
 jobs:
+  # Decide the version and whether this run publishes.
   version:
     name: Tag matches the Cargo workspace version
+    # The runner image (no registry credentials unless the job needs them).
     runs-on: ubuntu-latest
+    # Values later jobs read.
     outputs:
       dry_run: ${{ steps.mode.outputs.dry_run }}
     steps:
+      # The tagged commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # A tag push publishes. A manual run publishes only when dry_run is switched off AND it runs on a v* tag,
@@ -78,6 +83,7 @@ jobs:
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Refuse a tag that disagrees with the version in Cargo.toml.
       - name: Compare
         if: steps.mode.outputs.dry_run != 'true'
         env:
@@ -106,18 +112,22 @@ jobs:
   # `cosign verify-attestation --type spdxjson` returns the first, `--type cyclonedx` the second.
   sbom-crates:
     name: SBOM of the binary
+    # This job starts only after the jobs it needs have succeeded.
     needs: [version, verify]
     runs-on: ubuntu-latest
+    # Only what this job needs.
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The SBOM generator, pinned.
       - name: Install cargo-cyclonedx
         uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-cyclonedx@0.5.9
 
+      # One SBOM per binary, gated by the same check CI runs.
       - name: Generate the SBOMs of the two binaries
         run: |
           cargo cyclonedx --manifest-path crates/cli/Cargo.toml --format json --spec-version 1.5 \
@@ -154,9 +164,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Buildx produces the OCI archive and the provenance attestation.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # The OCI labels (source, revision, version) the image carries.
       - name: Compute labels
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -171,6 +183,7 @@ jobs:
           flavor: |
             latest=auto
 
+      # The archive is the one artifact every later job pushes, so what is scanned and signed is what was built.
       - name: Build (OCI archive, not pushed)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -202,6 +215,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Push each architecture image under a build-only tag; this is the only job before the merge that holds registry credentials.
   publish-arch:
     name: Push ${{ matrix.arch }} (quay.io + Docker Hub)
     needs: [version, build]
@@ -217,9 +231,11 @@ jobs:
         with:
           name: oci-${{ matrix.arch }}
           path: oci
+      # skopeo copies the OCI archive to the registries without a Docker daemon.
       - name: Install skopeo if the runner image lacks it
         run: command -v skopeo > /dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo; }
 
+      # Registry logins use repository secrets; nothing here prints them.
       - name: Log in to quay.io
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -227,6 +243,7 @@ jobs:
           username: ${{ secrets.QUAY_USERNAME }}
           password: ${{ secrets.QUAY_TOKEN }}
 
+      # The second public registry, with its own credentials.
       - name: Log in to Docker Hub
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -246,6 +263,7 @@ jobs:
           skopeo copy --all "oci-archive:oci/${ARCH}.tar" "docker://quay.io/${QUAY_NS}/${IMAGE}:${SHA}-${ARCH}"
           skopeo copy --all "oci-archive:oci/${ARCH}.tar" "docker://docker.io/${DOCKERHUB_NS}/${IMAGE}:${SHA}-${ARCH}"
 
+  # Join the architecture images into one index on both public registries, then scan, sign and attest it.
   merge-docker-public:
     name: Merge + sign (quay.io + Docker Hub)
     needs: [version, publish-arch, sbom-crates]
@@ -276,6 +294,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # The release tags for the public registries.
       - name: Compute final tags
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -345,9 +364,11 @@ jobs:
           ignore-unfixed: true
           version: v0.74.0
 
+      # Cosign signs and attests below; it is installed once per job.
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
+      # Keyless signatures over the index digest, from the tag's workflow identity.
       - name: Sign images (keyless)
         env:
           DIGEST: ${{ steps.merge.outputs.digest }}
@@ -357,6 +378,7 @@ jobs:
           cosign sign --yes "quay.io/${QUAY_NS}/${IMAGE}@${DIGEST}"
           cosign sign --yes "docker.io/${DOCKERHUB_NS}/${IMAGE}@${DIGEST}"
 
+      # The SBOM of the published image.
       - name: Generate SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -369,6 +391,7 @@ jobs:
         with:
           name: sbom-crates
 
+      # Each binary's SBOM is signed and attached to the digest.
       - name: Attest SBOMs (keyless)
         env:
           DIGEST: ${{ steps.merge.outputs.digest }}
@@ -382,6 +405,7 @@ jobs:
             done
           done
 
+      # GitHub-native provenance, pushed beside the image.
       - name: Attest build provenance (quay.io)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -389,6 +413,7 @@ jobs:
           subject-digest: ${{ steps.merge.outputs.digest }}
           push-to-registry: true
 
+      # The same provenance for the Docker Hub copy.
       - name: Attest build provenance (Docker Hub)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -396,6 +421,7 @@ jobs:
           subject-digest: ${{ steps.merge.outputs.digest }}
           push-to-registry: true
 
+      # The digest and the command anyone can run to verify the signature.
       - name: Summary
         run: |
           echo "Published & signed @ digest: ${{ steps.merge.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
@@ -455,6 +481,7 @@ jobs:
               || { echo "::error::${arch} image is missing the expected OCI labels"; exit 1; }
           done
 
+      # The same gate as the real release, so a dry run fails exactly when a release would.
       - name: Scan the merged image (fail on fixable CRITICAL/HIGH)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
@@ -486,11 +513,13 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
+      # oras copies the OCI referrers (signatures, attestations) that a plain copy does not.
       - name: Install oras
         uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
         with:
           version: 1.3.4
 
+      # The self-hosted registry is optional: this job may fail until its credentials exist.
       - name: Log in to self-hosted registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -498,6 +527,7 @@ jobs:
           username: ${{ secrets.PRIVATE_REGISTRY_USERNAME }}
           password: ${{ secrets.PRIVATE_REGISTRY_TOKEN }}
 
+      # The same tags as the public registries, so every registry returns one digest for one tag.
       - name: Compute tags
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -509,6 +539,7 @@ jobs:
           flavor: |
             latest=auto
 
+      # Copy by digest, compare the digest and verify the signature on the copy.
       - name: Copy the published image (same digest) and verify
         env:
           DIGEST: ${{ needs.merge-docker-public.outputs.digest }}

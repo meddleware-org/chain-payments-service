@@ -305,7 +305,6 @@ dependencies = [
  "access-gate-gateway-core",
  "anyhow",
  "base64 0.23.1",
- "chain-payments-core",
  "reqwest",
  "rustls",
  "serde_json",
@@ -359,7 +358,6 @@ dependencies = [
 name = "chain-payments-store"
 version = "0.0.5"
 dependencies = [
- "chain-payments-core",
  "hex",
  "serde_json",
  "sha2 0.11.1",

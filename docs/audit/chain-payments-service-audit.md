@@ -8,8 +8,10 @@
 **Template:** AUDIT_TEMPLATE.md (2026-11-01) + AUDIT_TEMPLATE_RUST.md (2026-10-08) + AUDIT_TEMPLATE_SUI_CLIENT.md (2026-10-08) +
   AUDIT_TEMPLATE_AUTH.md (2026-10-08) + AUDIT_TEMPLATE_DB.md (2026-10-25) + AUDIT_TEMPLATE_IMG.md (2026-10-08) +
   AUDIT_TEMPLATE_OPS.md (2026-10-08, `scripts/e2e-testnet.sh` only)
-**Deployment status:** unreleased (no tag; `0.0.1` in `Cargo.toml`). The image `quay.io/meddleware-org/chain-payments-service`
-  is not published: `config/images.yaml` digest `""`, so nothing runs in the cluster yet. The deployment is prepared in
+  - **Added 2026-11-26 (Part B documentation pass):** AUDIT_TEMPLATE_DOCS.md (2026-11-20); AUDIT_TEMPLATE_RFC.md (2026-11-19), ●: HTTP, JSON, timestamps, ed25519 and the webhook signature; AUDIT_TEMPLATE_IOP.md (2026-11-19), ●: the session API and
+    webhooks as the contract, the dependencies; AUDIT_TEMPLATE_PRIV.md (2026-11-20), ●: what the service stores about a payer and logs; AUDIT_TEMPLATE_CONF.md (2026-11-26), ●: the environment and the URLs it holds.
+**Deployment status:** *(Current, 2026-11-26: `v0.0.5` is released and pinned in `config/images.yaml` by digest `sha256:e952cda2…7933`; the text below is the 2026-11-17 state.)* Unreleased (no tag; `0.0.1` in `Cargo.toml`). The image `quay.io/meddleware-org/chain-payments-service`
+  was not yet published: `config/images.yaml` digest `""`, so nothing ran in the cluster. The deployment is prepared in
   `post-bootstrap/chain-payments/` and the database and keys are provisioned (SOPS, 2026-11-16). Testnet: verified end to end
   2026-11-16 against the throwaway TEST merchant (`scripts/e2e-testnet.sh`).
 **Review date:** 2026-11-17
@@ -656,7 +658,7 @@ vectors (SC and AUTH lenses).
 
 ### F31 — No release yet; the overlay deploys a tag
 
-**Severity:** Low   **Disposition:** DEFERRED (FU-0130)
+**Severity:** Low   **Disposition:** RESOLVED (FU-0130 done 2026-11-17: 0.0.1 released, digest-pinned and deployed; 0.0.5 current)
 **Where:** `config/images.yaml` (`digest: ""`); `overlays/default/kustomization.yaml` (`newTag: 0.0.1`); the deployment README
 step 1 (the quay.io repository is the maintainer's).
 **Issue:** IMG-M6: the deployment must run the signed index digest, not a tag.
@@ -669,6 +671,74 @@ policy-controller requires the image's signature.
 3. Run `refresh-digests.sh && sync-manifests.sh` so the overlay pins `@sha256:…`.
 
 Tracked in FU-0130.
+
+### Part B documentation pass (2026-11-26)
+
+Scope: every tracked file read against the workspace's `docs/operations/DOCUMENTATION_STANDARD.md` and annotated (Part B Phase 1, the twenty-seventh repository, the second Rust service); the DOCS, RFC, IOP, PRIV and CONF lenses applied for the first time.
+Before editing: `cargo test --workspace` (49 passed; the database tests need `TEST_DATABASE_URL` and return early without it, so this run did not exercise them). After: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` with `missing_docs`
+and `clippy::missing_docs_in_private_items` now **denied** in `[workspace.lints]`, and `cargo test --workspace` (52 passed, the same database caveat). The Rust diff is comment-only apart from F32 and F33 (compared with comment lines stripped). The migrations
+were not touched: sqlx checksums each applied file, comments included, so a released migration is never edited (they explain themselves in their headers, and the store's module notes give the picture). The image build, the smoke test, `cargo deny`
+and the live testnet script were not run here (no container daemon, no database, no wallet).
+
+#### B.RFC-1 Standards inventory
+
+| Standard | Where | Evidence |
+| --- | --- | --- |
+| HTTP semantics, RFC 9110: methods, status codes, `Authorization: Bearer` (RFC 6750 form, an API key rather than an OAuth token), `OPTIONS` preflight | `api.rs` | `merchant_api_needs_a_key_and_validates` and the other API tests |
+| JSON, RFC 8259, and timestamps, RFC 3339 (`crate::rfc3339`) | `api.rs`, `lib.rs` | the API tests |
+| EdDSA (ed25519), RFC 8032: quotes and webhooks are signed with it (`ring`) | `core/src/quote.rs`, `webhook.rs` | `round_trip_and_tampering`, the shared quote vectors |
+| CORS (the WHATWG Fetch standard) for the configured checkout origins only | `public_guard` | the CORS tests |
+| Base64, RFC 4648, for signatures and event fields | `core`, `chain-sui` | the vector tests |
+| Prometheus text exposition format 0.0.4 (de facto, not IETF) | `metrics.rs` | `render` is read by the monitoring stack |
+| gRPC-web over HTTP to the Sui full nodes and GraphQL over HTTP for event discovery (the Sui nodes' own interfaces) | `chain-sui` | the recorded-transaction tests |
+
+**B.RFC-2 Non-final standards:** none on the payment path other than the Sui node interfaces (SC lens). **B.RFC-3 Deviations:** the webhook signature header (`Chain-Payments-Signature: t=…,ed25519=…`) is this project's own scheme, chosen for its small verifier;
+the standards-based alternative is HTTP Message Signatures (RFC 9421), which ADR-0011 lists for Open Payments (built, off). Recorded as a deviation, not a defect.
+
+#### B.IOP Interoperability, portability and exit
+
+- **Portability and exit:** a merchant's data is its sessions, payments and webhooks, all in PostgreSQL in documented tables and returned by the merchant API; the money itself never passes through the service (it goes straight to the merchant's recipient on chain), so leaving
+  costs the merchant nothing it holds here.
+- **Open API:** the session API and the webhook format are documented in the README and ADR-0011; the webhook public key is published at `/v1/webhook-key`; no special access for our own clients (Link in Bio uses the same merchant API).
+- **Dependencies (exit register):** the Sui full nodes and GraphQL endpoint, the price sources (Kraken, Coinbase, CoinGecko), PostgreSQL, the base images, quay.io, Docker Hub, the self-hosted registry, GitHub Actions, Sigstore and Trivy.
+- **Incentives:** no telemetry, no ads, no tracking; the platform fee is the published one (it is in the on-chain package).
+
+#### B.PRIV Privacy honoured
+
+- **Browser storage:** none; the public router removes any `Set-Cookie` and sets `Cache-Control: no-store` (D134).
+- **Data held about a payer:** the paying address (public on chain) and the digest, kept with the session; no name, email or address of a person. The merchant's own metadata is returned unchanged and is the merchant's responsibility.
+- **Logs:** the session id and the digest on a confirmation, the merchant object on a hold, no client address, no API key, no webhook body; a failed webhook is stored as a class (`timeout`, `connection failed`, `HTTP <status>`) without the address.
+
+#### B.CONF Configuration and values
+
+- **Configuration surface:** `Config::from_env` and `DatabaseSettings::from_env` (one typed value each), documented in the README, `CLAUDE.md` and the deployment README.
+- **Values that can carry a credential:** `DATABASE_URL`, `SUI_GRPC_<NETWORK>` and `SUI_GRAPHQL_<NETWORK>` (a URL may carry a key), each merchant's webhook address (a path token), and the key files.
+- **Echo sweep (2026-11-26):** every `format!`, `bail!`, `anyhow!`, `tracing` call and `ConfigError` read. `DATABASE_URL` and the node URLs were never echoed by the configuration code. Two real echoes were found: `reqwest` error text names the
+  request URL, and it reached the log and the stored payment error (F32); and `merchant add --key-file` printed the stored and given webhook addresses (F33). The rejected `ALLOWED_ORIGINS` entry was repeated in the start-up error (fixed in the same pass).
+- **Single source:** the price-source hosts are constants in `prices.rs` (configuration chooses source names, not hosts).
+- **Validation:** each value is checked once at start with an error that names the variable.
+
+### F32 — A failed request to a full node or GraphQL endpoint carried the request URL into the log and the stored error
+**Severity:** Low   **Disposition:** RESOLVED (2026-11-26, unreleased)
+**Where:** `crates/chain-sui/src/lib.rs` (`HttpTransport::post_grpc_web`, `paid_events`).
+**Issue:** `reqwest`'s error text includes the URL of the failed request. The full-node and GraphQL URLs are configuration and can carry a key (a node behind an API key), and a failure reached `tracing` (`merchant unreadable`, `reconcile`) and, for a
+retryable payment check, the `last_error` column of `cp.payments`.
+**Impact:** a credential in a log and in a table; small, because the values are operator-set and the table is the operator's, but both can be shipped or read elsewhere.
+**Remediation / evidence:** the errors go through `reqwest::Error::without_url`, which keeps the failure class and drops the URL. `a_failed_request_never_repeats_the_url` sends both kinds of request to an address with a user name, password, path token and query key and
+asserts none of them (nor the host) appears in the error text.
+
+### F33 — `merchant add` and `merchant set-webhook` printed webhook addresses whole
+**Severity:** Low   **Disposition:** RESOLVED (2026-11-26, unreleased)
+**Where:** `crates/cli/src/main.rs` (`webhook_difference`, `set-webhook`).
+**Issue:** a merchant's webhook address can carry a token in its path or a key in its query (the table allows any `https://` address). The commands printed the stored and the given addresses in full, to a terminal or a Job log.
+**Remediation / evidence:** both name an address by its origin only (`describe_url` in the store crate: scheme, host and port); when only the path or query differs the note says so without showing either. `a_webhook_address_that_differs_only_in_its_secret_part_is_reported_without_showing_it`
+and `a_url_is_named_by_its_origin_only` test it.
+
+### F34 — Documentation drift, two unused dependencies and the missing doc lints
+**Severity:** Low   **Disposition:** RESOLVED (2026-11-26, unreleased)
+**Where:** `chain-payments-core` was a dependency of the store and Sui crates that use nothing from it; every crate lacked doc comments on most items and fields; there was no `CONTRIBUTING.md` and no `Development` section; the audit's deployment status and F31 were
+the 2026-11-17 text although 0.0.5 is released; `CHANGELOG.md` had no `Unreleased` section.
+**Remediation / evidence:** the dependencies are removed (the build and 52 tests pass); every item is documented and the lints denied; the documents are written; F31 and the deployment status are brought current (0.0.5, digest-pinned in `config/images.yaml`, FU-0130 done).
 
 ## Section A — Invariant verification matrix
 
@@ -944,6 +1014,10 @@ Not covered by tests:
   - deferred F24–F31 to FU-0123–FU-0128 and FU-0130;
   - opened OQ1–OQ3.
 
+- 2026-11-26 — Part B documentation pass and first application of the DOCS, RFC, IOP, PRIV and CONF lenses (above, "Part B documentation pass"). Baseline before editing: `cargo test --workspace` (49 passed). Every tracked file annotated to the documentation standard
+  (the migrations excluded, with the reason); the doc lints denied; `CONTRIBUTING.md` added; F31 and the deployment status brought current. Found and fixed **F32** (request URLs in full-node errors), **F33** (webhook addresses printed whole) and **F34**
+  (drift, unused dependencies). Re-run after editing: fmt, clippy `-D warnings`, `cargo test --workspace` (52 passed). Counts: F1 to F34.
+
 ## Pre-save consistency checklist (this pass)
 
 - [x] Section A ↔ findings (I6 GAP → F24; I17 GAP → F26/F27)
@@ -955,3 +1029,4 @@ Not covered by tests:
 - [x] Executive summary matches the current dispositions
 - [x] Counts re-measured (35 tests; `cargo deny` clean)
 - [x] Re-verification log entry
+- [x] 2026-11-26 (Part B pass): F32 to F34 added with the DOCS, RFC, IOP, PRIV and CONF lenses in the Template line; F31 current; counts F1 to F34.

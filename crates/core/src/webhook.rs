@@ -7,10 +7,14 @@ use base64::engine::general_purpose::STANDARD;
 
 use crate::quote::{Signer, verify};
 
+/// The header that carries the signature (lower case, as HTTP/2 sends it).
 pub const HEADER: &str = "chain-payments-signature";
+/// How old a signature may be before a merchant should refuse it, in seconds.
 pub const MAX_AGE_SECS: u64 = 300;
 
+/// Sign `<unix>.<body>` and return the header value `t=<unix>,ed25519=<base64>`.
 pub fn sign(signer: &Signer, unix: u64, body: &[u8]) -> String {
+    // The signed message is the timestamp, a dot and the exact body bytes, so neither can be swapped.
     let mut msg = format!("{unix}.").into_bytes();
     msg.extend_from_slice(body);
     format!("t={unix},ed25519={}", STANDARD.encode(signer.sign(&msg)))
@@ -20,6 +24,7 @@ pub fn sign(signer: &Signer, unix: u64, body: &[u8]) -> String {
 pub fn check(public: &[u8], header: &str, body: &[u8], now_unix: u64) -> bool {
     let mut t = None;
     let mut sig = None;
+    // Read `t` and `ed25519` from the header; unknown parts are ignored.
     for part in header.split(',') {
         match part.split_once('=') {
             Some(("t", v)) => t = v.parse::<u64>().ok(),
@@ -28,6 +33,7 @@ pub fn check(public: &[u8], header: &str, body: &[u8], now_unix: u64) -> bool {
         }
     }
     let (Some(t), Some(sig)) = (t, sig) else { return false };
+    // A stale (or far-future) timestamp is refused, which limits replay.
     if now_unix.abs_diff(t) > MAX_AGE_SECS {
         return false;
     }
@@ -36,10 +42,12 @@ pub fn check(public: &[u8], header: &str, body: &[u8], now_unix: u64) -> bool {
     verify(public, &msg, &sig)
 }
 
+/// Unit tests for this module.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Round trip and tampering.
     #[test]
     fn round_trip_and_tampering() {
         let s = Signer::from_seed(&[7u8; 32]).unwrap();

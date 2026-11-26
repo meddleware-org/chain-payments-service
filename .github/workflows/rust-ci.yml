@@ -5,23 +5,29 @@ name: Rust CI
 # build, vulnerability scan, smoke test). The live testnet end-to-end run (scripts/e2e-testnet.sh) needs a funded key and
 # is a release-time check, not CI.
 
+# Every push to main and every pull request; the release workflow calls this one on the tagged commit.
 on:
   push:
     branches: ["main"]
   pull_request:
+  # The release workflow reuses this one on the tagged commit.
   workflow_call:
 
+# Least privilege: CI only reads the repository.
 permissions:
   contents: read
 
 env:
+  # No tool in the pipeline may send telemetry.
   DO_NOT_TRACK: "1"
 
 jobs:
+  # The main gate: format, lints, tests against a real database, coverage, dependency policy and the SBOM check.
   check:
     name: fmt, clippy, test (PostgreSQL), coverage, cargo-deny, SBOM gate
     runs-on: ubuntu-latest
     steps:
+      # The commit under test.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the stable toolchain
@@ -31,6 +37,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The signed-message vectors are shared with the Move package, so both sides stay byte-for-byte equal.
       - name: Quote vectors match chain-payments-sui
         # fixtures/quote-vectors.json is a copy of the Move package's tests/vectors.json at this commit. A change on
         # either side fails here until both are updated together (and this pin moved).
@@ -39,12 +46,15 @@ jobs:
         run: |
           curl -fsSL "https://raw.githubusercontent.com/meddleware-org/chain-payments-sui/${VECTORS_COMMIT}/tests/vectors.json" -o /tmp/move-vectors.json
           cmp /tmp/move-vectors.json fixtures/quote-vectors.json
+      # Formatting is not negotiable in review: the check fails on any difference.
       - name: Format check
         run: cargo fmt --check
 
+      # Warnings are errors, and the workspace lints (missing docs, no unsafe code) are part of the gate.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # A throwaway database with TLS, so the tests exercise the same verify-full path as production.
       - name: Start PostgreSQL (TLS)
         run: bash scripts/test-postgres.sh start
 
@@ -62,14 +72,17 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.1,cargo-cyclonedx@0.5.9
 
+      # The line coverage is printed to the job summary: informational, not a gate.
       - name: Coverage
         run: |
           cargo llvm-cov --workspace --locked --summary-only | tee coverage.txt
           { echo '### Line coverage'; echo '```'; tail -n 3 coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+      # Advisories, licences, bans and sources per deny.toml.
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+      # The release attests a CycloneDX SBOM per binary; this is the gate it must pass there too.
       - name: SBOM gate
         run: |
           bash scripts/tests/check-sbom-test.sh
@@ -77,18 +90,22 @@ jobs:
             --no-build-deps --target x86_64-unknown-linux-gnu -q
           bash scripts/check-sbom.sh crates/cli/chain-payments.cdx.json chain-payments
 
+      # The gate the release uses to merge the two architecture images is tested here.
       - name: Index gate tests
         run: bash scripts/tests/check-index-test.sh
 
+      # Always stop it, even when a step failed, so the runner is left clean.
       - name: Stop PostgreSQL
         if: always()
         run: bash scripts/test-postgres.sh stop
 
+  # The declared minimum Rust version must still build and pass the tests, so `rust-version` is a fact, not a hope.
   msrv:
     name: MSRV (rust-version in Cargo.toml)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The oldest compiler the manifest promises to support.
       - name: Install the declared minimum toolchain
         run: rustup toolchain install 1.94 --profile minimal --no-self-update && rustup default 1.94
       - name: Start PostgreSQL (TLS)
@@ -99,6 +116,7 @@ jobs:
         if: always()
         run: bash scripts/test-postgres.sh stop
 
+  # The release image: scanned configuration, licence notices, the build, a vulnerability scan and a smoke test.
   image:
     name: Image (configuration scan, licence notices, build, scan, smoke test)
     runs-on: ubuntu-latest
@@ -115,12 +133,14 @@ jobs:
           exit-code: "1"
           version: v0.74.0
 
+      # Fails when a linked crate's licence is not accepted by about.toml.
       - name: Third-party licence notices
         run: |
           docker build --target notices --tag chain-payments-service:notices .
           docker run --rm chain-payments-service:notices cat /out/THIRD_PARTY_LICENSES.txt > THIRD_PARTY_LICENSES.txt
           test -s THIRD_PARTY_LICENSES.txt
 
+      # The Dockerfile as the release builds it, tagged locally only.
       - name: Build (not pushed)
         run: docker build --tag chain-payments-service:ci .
 
@@ -133,5 +153,6 @@ jobs:
           ignore-unfixed: true
           version: v0.74.0
 
+      # scripts/smoke.sh runs migrate, serve and worker as separate containers, as the cluster does.
       - name: Smoke test (migrate, serve and worker against PostgreSQL)
         run: bash scripts/smoke.sh chain-payments-service:ci

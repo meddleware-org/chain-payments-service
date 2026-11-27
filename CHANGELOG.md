@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.0.6] - 2026-11-27
+
 - A request error from a full node or the GraphQL endpoint no longer names the URL it was sent to (the URL can carry a credential), and
   `merchant add` and `merchant set-webhook` name a webhook address by its origin only, never its path or query. A rejected `ALLOWED_ORIGINS`
   entry is no longer repeated in the start-up error.

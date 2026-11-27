@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "chain-payments"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "chain-payments-chain-sui"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "access-gate-gateway-core",
  "anyhow",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "chain-payments-core"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "chain-payments-service"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "access-gate-gateway-core",
  "anyhow",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "chain-payments-store"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "hex",
  "serde_json",

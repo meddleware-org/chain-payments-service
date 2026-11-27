@@ -26,6 +26,10 @@ this service verifies the payment and tells the merchant by a signed webhook. Us
 - **No `unsafe`**, no `unwrap`/`expect` on request paths, no SQL outside `crates/store`, dynamic SQL only via
   `AssertSqlSafe` with a reason.
 
+## Documentation rules (workspace documentation standard, D144)
+
+Every file has a `//!` header and every item a `///` doc comment, private items included; line comments say why. `missing_docs` and `clippy::missing_docs_in_private_items` are `deny` in the workspace lints, so clippy fails the build on a gap. `node scripts/check-docs.mjs --report chain-payments-service` (in the workspace repository) is the gate. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Commands
 
 ```bash

@@ -43,7 +43,7 @@ anyhow = "=1.0.104"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
 # URL parsing (webhook targets, database URLs).
-url = "=2.5.8"
+url = "=2.5.9"
 # Timestamps stored in the database and printed in RFC 3339.
 time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing"] }
 # Random identifiers for merchants and webhooks.

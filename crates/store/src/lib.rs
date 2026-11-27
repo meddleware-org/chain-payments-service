@@ -698,10 +698,10 @@ impl Store {
     ) -> Result<Settled, DbError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
+            // Lock the claim and its session until the transaction ends, so the API and the worker cannot settle the same claim twice.
             "SELECT p.session_id, s.merchant_id, s.metadata, s.amount_pence, s.units, s.subscription_ref, q.method_id, \
              q.coin_type, q.amount, q.price FROM cp.payments p JOIN cp.sessions s ON s.id = p.session_id \
              JOIN cp.quotes q ON q.nonce = p.nonce WHERE p.digest = $1 AND p.nonce = $2 AND p.status = 'pending' \
-             // Lock the claim and its session until the transaction ends, so the API and the worker cannot settle the same claim twice.
              FOR UPDATE OF p, s",
         )
         .bind(digest)
@@ -729,8 +729,8 @@ impl Store {
         // Not paid by this claim means the session was already paid or cancelled: the money arrived but nothing was bought.
         let status = if paid { "confirmed" } else { "unapplied" };
         sqlx::query(
+            // An unapplied claim records why, so a person can see it in the table.
             "UPDATE cp.payments SET status = $3, payer = $4, paid_until_ms = $5, confirmed_at = $6, \
-             // An unapplied claim records why, so a person can see it in the table.
              last_error = CASE WHEN $3 = 'unapplied' THEN 'paid on-chain, but the session was no longer open' ELSE NULL END \
              WHERE digest = $1 AND nonce = $2",
         )
@@ -820,10 +820,10 @@ impl Store {
     ) -> Result<Vec<Webhook>, DbError> {
         let rows = sqlx::query(
             // The lease: pushing `next_at` forward when claiming means a worker that dies mid-delivery is retried later instead of never.
+            // Oldest due first, undelivered only, at most `limit`.
+            // Rows another worker holds are skipped, so two workers never take the same webhook.
             "UPDATE cp.webhooks SET next_at = $1 + make_interval(secs => $3), attempts = attempts + 1 WHERE id IN \
-             // Oldest due first, undelivered only, at most `limit`.
              (SELECT id FROM cp.webhooks WHERE delivered_at IS NULL AND next_at <= $1 ORDER BY next_at LIMIT $2 \
-             // Rows another worker holds are skipped, so two workers never take the same webhook.
              FOR UPDATE SKIP LOCKED) RETURNING id, merchant_id, event, payload, attempts",
         )
         .bind(now)

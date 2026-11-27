@@ -23,7 +23,7 @@ chain-payments-service = { path = "crates/service" }
 # The platform's shared gRPC-web client and protobuf reader (one implementation for the whole platform).
 access-gate-gateway-core = "=0.0.33"
 # PostgreSQL with rustls (ring) for TLS; runtime-checked queries and embedded migrations.
-sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
+sqlx = { version = "=0.9.1", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
 # The HTTP server and routing.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tower-log"] }
 # Concurrency limit, timeout and utilities for the routers.
@@ -32,13 +32,13 @@ tower-http = { version = "=0.7.1", default-features = false, features = ["timeou
 # The async runtime; each crate enables the features it needs.
 tokio = { version = "=1.54.1", default-features = false }
 # The command line of the single binary.
-clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+clap = { version = "=4.6.9", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 # Serialisation of the API bodies and the stored JSON.
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 # Error types for libraries; `anyhow` is for the binaries and the glue.
 thiserror = "=2.0.21"
-anyhow = "=1.0.104"
+anyhow = "=1.0.105"
 # Structured logs.
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
@@ -47,7 +47,7 @@ url = "=2.5.9"
 # Timestamps stored in the database and printed in RFC 3339.
 time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing"] }
 # Random identifiers for merchants and webhooks.
-uuid = { version = "=1.29.0", default-features = false, features = ["std", "v4", "serde"] }
+uuid = { version = "=1.29.3", default-features = false, features = ["std", "v4", "serde"] }
 # Base64 for signatures and event fields.
 base64 = "=0.23.1"
 hex = "=0.4.3"
